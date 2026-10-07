@@ -1,5 +1,5 @@
 // src/pages/Auth/AuthCallback.tsx
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 import { authService } from "../../services/authService";
 import { useAuth } from "../../context/AuthContext";
@@ -10,6 +10,25 @@ import { useAuth } from "../../context/AuthContext";
  *
  * После успешного обмена code → tokens сохраняет их
  * и редиректит пользователя на главную.
+ *
+ * ВАЖНО:
+ *   Обработка запускается РОВНО ОДИН РАЗ за всю жизнь компонента.
+ *   Для этого используем ref-флаг `isProcessing`.
+ *
+ *   Почему это критично:
+ *     - В React 18/19 StrictMode (dev) useEffect срабатывает
+ *       дважды при монтировании.
+ *     - Кроме того, `refreshUser` из AuthContext НЕ обёрнут в
+ *       useCallback, поэтому на каждом ре-рендере AuthProvider
+ *       получает новую ссылку на функцию, и если бы мы указали
+ *       refreshUser в зависимостях useEffect, эффект срабатывал бы
+ *       на каждом ре-рендере провайдера.
+ *     - При повторном вызове handleCallback параметр `state`
+ *       из sessionStorage уже удалён (первый вызов его почистил),
+ *       и мы получаем ложную ошибку "Недействительный параметр state".
+ *
+ *   Ref-флаг решает обе проблемы: сколько бы раз ни сработал эффект,
+ *   настоящая обработка произойдёт только в первый раз.
  */
 const AuthCallback: React.FC = () => {
     const [searchParams] = useSearchParams();
@@ -17,7 +36,22 @@ const AuthCallback: React.FC = () => {
     const { refreshUser } = useAuth();
     const [error, setError] = useState("");
 
+    /**
+     * Флаг "обработка уже запущена".
+     * useRef сохраняет значение между ре-рендерами и не вызывает
+     * ре-рендер при изменении — идеально для таких guard-ов.
+     */
+    const isProcessing = useRef(false);
+
     useEffect(() => {
+        // Если уже обрабатывали — молча выходим.
+        // Это защита от StrictMode и от повторных срабатываний
+        // useEffect при ре-рендерах AuthProvider.
+        if (isProcessing.current) {
+            return;
+        }
+        isProcessing.current = true;
+
         const handleCallback = async () => {
             const code = searchParams.get("code");
             const state = searchParams.get("state");
@@ -35,20 +69,40 @@ const AuthCallback: React.FC = () => {
 
             try {
                 await authService.handleCallback(code, state);
-                // Обновляем контекст
-                await refreshUser();
-                // Редирект на главную
+
+                // Обновляем контекст аутентификации (подтягиваем user
+                // из userinfo в React-состояние AuthProvider).
+                //
+                // Если refreshUser кинет ошибку — это не критично,
+                // токен уже сохранён, и следующий переход по приложению
+                // либо отработает, либо отправит пользователя на /login.
+                try {
+                    await refreshUser();
+                } catch (refreshErr) {
+                    console.warn(
+                        "[AuthCallback] refreshUser после обмена токенов не удался:",
+                        refreshErr
+                    );
+                }
+
+                // Редирект на главную.
                 navigate("/", { replace: true });
             } catch (err: any) {
                 console.error("Callback error:", err);
                 setError(
-                    err.message || "Ошибка обработки аутентификации. Попробуйте снова."
+                    err.message ||
+                    "Ошибка обработки аутентификации. Попробуйте снова."
                 );
             }
         };
 
         handleCallback();
-    }, [searchParams, navigate, refreshUser]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+    // ↑ Пустые зависимости — эффект срабатывает один раз при монтировании.
+    //   searchParams/navigate/refreshUser читаются из замыкания первого
+    //   рендера. Для этого сценария это корректно: URL /auth/callback?...
+    //   не меняется за время жизни компонента, а navigate стабилен.
 
     if (error) {
         return (
