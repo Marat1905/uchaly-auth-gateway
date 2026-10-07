@@ -17,7 +17,7 @@ entries:
     identifiers:
       name: Admin
     attrs:
-      is_superuser: false
+      is_superuser: true
 
   - model: authentik_core.group
     id: group-user
@@ -92,6 +92,7 @@ entries:
       name: "System Administrator"
       email: "admin@uchaly.com"
       is_active: true
+      is_superuser: true
       path: "users"
       type: "internal"
       attributes: {}
