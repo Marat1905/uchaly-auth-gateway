@@ -1,0 +1,6 @@
+services:
+  uchaly.apigateway:
+    image: ${DOCKER_REGISTRY-}uchalyapigateway
+    build:
+      context: .
+      dockerfile: src/Uchaly.APIgateway/Dockerfile

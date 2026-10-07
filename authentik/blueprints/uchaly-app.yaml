@@ -1,0 +1,308 @@
+# yaml-language-server: $schema=https://goauthentik.io/blueprints/schema.json
+version: 1
+metadata:
+  name: "Uchaly Application Setup"
+  labels:
+    blueprints.goauthentik.io/instantiate: "true"
+
+entries:
+  # ============================================================
+  # ГРУППЫ РОЛЕЙ
+  # Аналог таблицы Roles из кастомного Identity.
+  # Создаются первыми, потому что на них ссылаются и пользователи,
+  # и policy bindings в конце файла.
+  # ============================================================
+  - model: authentik_core.group
+    id: group-admin
+    identifiers:
+      name: Admin
+    attrs:
+      is_superuser: false
+
+  - model: authentik_core.group
+    id: group-user
+    identifiers:
+      name: User
+
+  - model: authentik_core.group
+    id: group-manager
+    identifiers:
+      name: Manager
+
+  - model: authentik_core.group
+    id: group-diagnost
+    identifiers:
+      name: Diagnost
+
+  - model: authentik_core.group
+    id: group-service
+    identifiers:
+      name: Service
+
+  - model: authentik_core.group
+    id: group-safety
+    identifiers:
+      name: Safety
+
+  - model: authentik_core.group
+    id: group-tcx
+    identifiers:
+      name: TCX
+
+  - model: authentik_core.group
+    id: group-electric
+    identifiers:
+      name: Electric
+
+  # ============================================================
+  # PROPERTY MAPPING: добавление групп (ролей) в токен
+  # Определяется до провайдера, чтобы можно было на него ссылаться.
+  # ============================================================
+  - model: authentik_providers_oauth2.scopemapping
+    id: scope-groups
+    identifiers:
+      name: "Uchaly: Groups Claim"
+    attrs:
+      scope_name: groups
+      description: "Include user groups in token"
+      expression: |
+        return {
+            "groups": [group.name for group in user.ak_groups.all()],
+            "roles": [group.name for group in user.ak_groups.all()]
+        }
+
+  # ============================================================
+  # ТЕСТОВЫЕ ПОЛЬЗОВАТЕЛИ
+  # ВНИМАНИЕ: это тестовые учётные записи для разработки.
+  # Перед выводом в production — удалить или заменить на реальные.
+  # Пароли соответствуют тем, что были в кастомном SeedData.cs:
+  #   admin          / Admin123!
+  #   manager        / Manager123!
+  #   diagnost       / Diagnost123!
+  #   ElectroService / Service123!
+  #   MexService     / Service123!
+  # ============================================================
+
+  # --- admin ---
+  - model: authentik_core.user
+    id: user-admin
+    identifiers:
+      username: admin
+    attrs:
+      name: "System Administrator"
+      email: "admin@uchaly.com"
+      is_active: true
+      path: "users"
+      type: "internal"
+      attributes: {}
+      password: "Admin123!"
+
+  # --- manager ---
+  - model: authentik_core.user
+    id: user-manager
+    identifiers:
+      username: manager
+    attrs:
+      name: "John Manager"
+      email: "manager@uchaly.com"
+      is_active: true
+      path: "users"
+      type: "internal"
+      attributes: {}
+      password: "Manager123!"
+
+  # --- diagnost ---
+  - model: authentik_core.user
+    id: user-diagnost
+    identifiers:
+      username: diagnost
+    attrs:
+      name: "John Diagnost"
+      email: "diagnost@uchaly.com"
+      is_active: true
+      path: "users"
+      type: "internal"
+      attributes: {}
+      password: "Diagnost123!"
+
+  # --- ElectroService ---
+  - model: authentik_core.user
+    id: user-electroservice
+    identifiers:
+      username: ElectroService
+    attrs:
+      name: "Electro Service"
+      email: "ElectroService@uchaly.com"
+      is_active: true
+      path: "users"
+      type: "internal"
+      attributes: {}
+      password: "Service123!"
+
+  # --- MexService ---
+  - model: authentik_core.user
+    id: user-mexservice
+    identifiers:
+      username: MexService
+    attrs:
+      name: "Mex Service"
+      email: "MexService@uchaly.com"
+      is_active: true
+      path: "users"
+      type: "internal"
+      attributes: {}
+      password: "Service123!"
+
+  # ============================================================
+  # ПРИВЯЗКА ПОЛЬЗОВАТЕЛЕЙ К ГРУППАМ
+  # ============================================================
+  - model: authentik_core.group
+    id: group-admin-members
+    identifiers:
+      name: Admin
+    attrs:
+      users:
+        - !KeyOf user-admin
+
+  - model: authentik_core.group
+    id: group-manager-members
+    identifiers:
+      name: Manager
+    attrs:
+      users:
+        - !KeyOf user-manager
+
+  - model: authentik_core.group
+    id: group-diagnost-members
+    identifiers:
+      name: Diagnost
+    attrs:
+      users:
+        - !KeyOf user-diagnost
+
+  - model: authentik_core.group
+    id: group-service-members
+    identifiers:
+      name: Service
+    attrs:
+      users:
+        - !KeyOf user-electroservice
+        - !KeyOf user-mexservice
+
+  # ============================================================
+  # OAUTH2 / OIDC ПРОВАЙДЕР
+  # ВАЖНО: поле называется redirect_uris (не allowed_redirect_uris).
+  # ============================================================
+  - model: authentik_providers_oauth2.oauth2provider
+    id: provider-uchaly
+    identifiers:
+      name: Uchaly OAuth2 Provider
+    attrs:
+      client_type: public
+      client_id: uchaly-frontend
+      redirect_uris:
+        - matching_mode: strict
+          url: "http://localhost:62080/auth/callback"
+        - matching_mode: strict
+          url: "http://localhost:3000/auth/callback"
+        - matching_mode: strict
+          url: "http://10.0.9.100:62080/auth/callback"
+        - matching_mode: strict
+          url: "http://localhost:30008/auth/callback"
+        - matching_mode: strict
+          url: "http://localhost/auth/callback"
+        - matching_mode: strict
+          url: "http://localhost:8080/auth/callback"
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'openid'"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'email'"]]
+        - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'profile'"]]
+        - !KeyOf scope-groups
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
+      access_token_validity: "hours=1"
+      refresh_token_validity: "days=1"
+      sub_mode: "user_email"
+
+  # ============================================================
+  # ПРИЛОЖЕНИЕ
+  # ============================================================
+  - model: authentik_core.application
+    id: app-uchaly
+    identifiers:
+      slug: uchaly
+    attrs:
+      name: "Uchaly"
+      provider: !KeyOf provider-uchaly
+      meta_description: "Uchaly Corporate Platform"
+      meta_publisher: "Uchaly"
+      open_in_new_tab: false
+
+  # ============================================================
+  # POLICY BINDINGS
+  # Дают доступ к приложению Uchaly членам соответствующих групп.
+  # ============================================================
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-admin
+      order: 10
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-user
+      order: 20
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-diagnost
+      order: 30
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-service
+      order: 40
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-manager
+      order: 50
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-safety
+      order: 60
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-tcx
+      order: 70
+    attrs:
+      enabled: true
+
+  - model: authentik_policies.policybinding
+    identifiers:
+      target: !KeyOf app-uchaly
+      group: !KeyOf group-electric
+      order: 80
+    attrs:
+      enabled: true

@@ -1,0 +1,55 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.37111.16 d17.14
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Элементы решения", "Элементы решения", "{754FC069-D67B-A9D7-50A1-8D1CA196D8F1}"
+	ProjectSection(SolutionItems) = preProject
+		.env = .env
+		.env.example = .env.example
+		setup-env.ps1 = setup-env.ps1
+	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{36D591C7-65C7-A0D1-1CBC-10CDE441BDC8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Uchaly.APIgateway", "src\Uchaly.APIgateway\Uchaly.APIgateway.csproj", "{E5B34CBD-3DAB-4CE0-9F4D-CA2365910DB6}"
+EndProject
+Project("{E53339B2-1760-4266-BCC7-CA923CBCF16C}") = "docker-compose", "docker-compose.dcproj", "{81DDED9D-158B-E303-5F62-77A2896D2A5A}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "authentik", "authentik", "{C8D7F280-AA30-46B7-93D5-752F7EBE5E6D}"
+	ProjectSection(SolutionItems) = preProject
+		authentik\.env = authentik\.env
+		authentik\docker-compose.yml = authentik\docker-compose.yml
+	EndProjectSection
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "blueprints", "blueprints", "{83E1619B-26CE-42B5-B0BA-8333B510656B}"
+	ProjectSection(SolutionItems) = preProject
+		authentik\blueprints\uchaly-app.yaml = authentik\blueprints\uchaly-app.yaml
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E5B34CBD-3DAB-4CE0-9F4D-CA2365910DB6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E5B34CBD-3DAB-4CE0-9F4D-CA2365910DB6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E5B34CBD-3DAB-4CE0-9F4D-CA2365910DB6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E5B34CBD-3DAB-4CE0-9F4D-CA2365910DB6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{81DDED9D-158B-E303-5F62-77A2896D2A5A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{81DDED9D-158B-E303-5F62-77A2896D2A5A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{81DDED9D-158B-E303-5F62-77A2896D2A5A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{81DDED9D-158B-E303-5F62-77A2896D2A5A}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{E5B34CBD-3DAB-4CE0-9F4D-CA2365910DB6} = {36D591C7-65C7-A0D1-1CBC-10CDE441BDC8}
+		{83E1619B-26CE-42B5-B0BA-8333B510656B} = {C8D7F280-AA30-46B7-93D5-752F7EBE5E6D}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {2BD8A273-FBE8-42BF-A8EB-77881A2DF4B5}
+	EndGlobalSection
+EndGlobal
