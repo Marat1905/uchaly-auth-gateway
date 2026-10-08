@@ -76,6 +76,63 @@ entries:
         }
 
   # ============================================================
+  # PROPERTY MAPPING: profile-claim с ФИО из атрибутов
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   Стандартный маппинг Authentik "authentik default OAuth Mapping:
+  #   OpenID 'profile'" формирует given_name/family_name путём
+  #   разбиения единого поля user.name по пробелам. Но у нас больше
+  #   нет единого поля name — при регистрации пользователь вводит
+  #   Фамилия/Имя/Отчество раздельно, и они сохраняются в JSONB-поле
+  #   user.attributes под ключами family_name, given_name, middle_name.
+  #
+  #   Поэтому мы подменяем стандартный profile-маппинг своим, который:
+  #     1. Читает три атрибута напрямую.
+  #     2. Склеивает их в единое поле `name` в формате
+  #        "Фамилия Имя Отчество" (для отображения).
+  #     3. Возвращает каждое из трёх значений отдельным claim'ом
+  #        (given_name, family_name, middle_name) — чтобы фронтенд
+  #        мог разложить их в firstName / lastName / patronymic.
+  #
+  #   preferred_username и nickname отдаём как username пользователя —
+  #   так же, как это делает стандартный маппинг Authentik.
+  # ============================================================
+  - model: authentik_providers_oauth2.scopemapping
+    id: scope-profile-uchaly
+    identifiers:
+      name: "Uchaly: Profile Claim"
+    attrs:
+      scope_name: profile
+      description: "Profile claim с раздельными ФИО из user.attributes"
+      expression: |
+        # Читаем атрибуты, записанные на этапе регистрации (UserWriteStage).
+        family = user.attributes.get("family_name", "") or ""
+        given  = user.attributes.get("given_name", "") or ""
+        middle = user.attributes.get("middle_name", "") or ""
+
+        # Склеиваем в единое "Фамилия Имя Отчество" в русском порядке.
+        # Если атрибутов нет — падаём на user.name (стандартное поле
+        # Authentik) или username, чтобы claim name никогда не был пустым.
+        parts = []
+        if family:
+            parts.append(family)
+        if given:
+            parts.append(given)
+        if middle:
+            parts.append(middle)
+
+        full_name = " ".join(parts) if parts else (user.name or user.username)
+
+        return {
+            "name": full_name,
+            "given_name": given,
+            "family_name": family,
+            "middle_name": middle,
+            "preferred_username": user.username,
+            "nickname": user.username,
+        }
+
+  # ============================================================
   # FLOW АВТОРИЗАЦИИ С ПОЛНОЦЕННОЙ АУТЕНТИФИКАЦИЕЙ
   #
   # ЗАЧЕМ ЭТО НУЖНО:
@@ -219,8 +276,8 @@ entries:
   #   самостоятельной регистрации НЕ подходят.
   #
   #   Поэтому все стадии enrollment-флоу создаются ЯВНО:
-  #     1. Prompt-объекты (6 отдельных полей формы, включая
-  #        скрытое поле type=internal)
+  #     1. Prompt-объекты (теперь 8 полей, включая скрытое type=internal
+  #        и раздельные ФИО: Фамилия / Имя / Отчество)
   #     2. Prompt Stage (контейнер над полями)
   #     3. User Write Stage (создаёт пользователя и кладёт в группу User)
   #     4. User Login Stage (логинит после регистрации)
@@ -237,8 +294,23 @@ entries:
   #   первый раз проходит, второй — падает.
   #
   #   `field_key` при этом остаётся важным — оно уходит в attrs
-  #   и используется для маппинга значений на модель пользователя
-  #   (username/name/email/password/type).
+  #   и используется для маппинга значений на модель пользователя.
+  #
+  # ВАЖНО ПРО АТРИБУТЫ (family_name / given_name / middle_name):
+  #   Модель authentik_core.user НЕ имеет отдельных колонок под имя
+  #   и фамилию — есть только единое поле `name`. Дополнительные
+  #   поля хранятся в JSONB-поле user.attributes.
+  #
+  #   UserWriteStage понимает префикс `attributes.` в field_key:
+  #   если prompt имеет field_key = "attributes.family_name", то
+  #   UserWriteStage запишет в user.attributes["family_name"] то,
+  #   что ввёл пользователь. Именно этим механизмом мы и
+  #   пользуемся для трёх отдельных полей ФИО.
+  #
+  #   Далее кастомный scope-mapping "Uchaly: Profile Claim" (см.
+  #   выше) читает эти атрибуты и формирует OIDC-claims
+  #   given_name / family_name / middle_name / name, которые
+  #   SPA читает в fetchUserInfo().
   #
   # ВАЖНО ПРО type=internal:
   #   Enrollment-flow в Authentik (включая 2026.8.3) создаёт
@@ -246,7 +318,7 @@ entries:
   #   им заходить в /if/user/ и /if/admin/ — интерфейс Authentik
   #   доступен только пользователям с типом "internal".
   #
-  #   Чтобы обойти это, добавлено ШЕСТОЕ скрытое поле prompt с
+  #   Чтобы обойти это, добавлено СКРЫТОЕ поле prompt с
   #   field_key: type и initial_value: internal. Prompt Stage
   #   передаёт его значение в UserWriteStage, который записывает
   #   его в поле type новой модели пользователя.
@@ -281,8 +353,9 @@ entries:
   # Каждое поле — это отдельная запись модели authentik_stages_prompt.prompt.
   # Поле field_key — это внутренний идентификатор поля, который потом
   # используется при маппинге значений на модель пользователя.
-  # Для username/name/email/password/type Authentik мапит автоматически
-  # по именам полей.
+  # Для username/email/password/type Authentik мапит автоматически
+  # по именам полей. Для всего, что начинается с `attributes.`,
+  # значение попадает в JSONB-поле user.attributes.
   #
   # ПОЛЕ order: определяет порядок полей в UI-форме.
   #
@@ -302,23 +375,57 @@ entries:
       name: "Uchaly Enrollment Username"
     attrs:
       field_key: username
-      label: "Имя пользователя"
+      label: "Имя пользователя (логин)"
       type: username
       required: true
       placeholder: "Введите логин"
       order: 10
 
+  # --- Фамилия ---
+  # field_key с префиксом attributes. → значение попадёт в
+  # user.attributes["family_name"], откуда его прочитает наш
+  # кастомный scope-mapping "Uchaly: Profile Claim".
   - model: authentik_stages_prompt.prompt
-    id: prompt-enroll-name
+    id: prompt-enroll-family-name
     identifiers:
-      name: "Uchaly Enrollment Name"
+      name: "Uchaly Enrollment Family Name"
     attrs:
-      field_key: name
-      label: "Полное имя"
+      field_key: attributes.family_name
+      label: "Фамилия"
       type: text
       required: true
-      placeholder: "Иван Иванов"
+      placeholder: "Иванов"
       order: 20
+
+  # --- Имя ---
+  # field_key = attributes.given_name → user.attributes["given_name"].
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-given-name
+    identifiers:
+      name: "Uchaly Enrollment Given Name"
+    attrs:
+      field_key: attributes.given_name
+      label: "Имя"
+      type: text
+      required: true
+      placeholder: "Иван"
+      order: 30
+
+  # --- Отчество ---
+  # field_key = attributes.middle_name → user.attributes["middle_name"].
+  # Не обязательно — у пользователей может не быть отчества
+  # (например, для иностранных сотрудников).
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-middle-name
+    identifiers:
+      name: "Uchaly Enrollment Middle Name"
+    attrs:
+      field_key: attributes.middle_name
+      label: "Отчество"
+      type: text
+      required: false
+      placeholder: "Иванович"
+      order: 40
 
   - model: authentik_stages_prompt.prompt
     id: prompt-enroll-email
@@ -330,7 +437,7 @@ entries:
       type: email
       required: true
       placeholder: "user@uchaly.com"
-      order: 30
+      order: 50
 
   - model: authentik_stages_prompt.prompt
     id: prompt-enroll-password
@@ -342,7 +449,7 @@ entries:
       type: password
       required: true
       placeholder: "Введите пароль"
-      order: 40
+      order: 60
 
   - model: authentik_stages_prompt.prompt
     id: prompt-enroll-password-repeat
@@ -354,7 +461,7 @@ entries:
       type: password
       required: true
       placeholder: "Повторите пароль"
-      order: 50
+      order: 70
 
   # --- Скрытый prompt: принудительно ставит type=internal ---
   #
@@ -380,7 +487,7 @@ entries:
       type: hidden
       required: false
       initial_value: "internal"
-      order: 60
+      order: 80
 
   # --- Prompt Stage: контейнер, объединяющий все поля формы ---
   #
@@ -398,7 +505,9 @@ entries:
     attrs:
       fields:
         - !KeyOf prompt-enroll-username
-        - !KeyOf prompt-enroll-name
+        - !KeyOf prompt-enroll-family-name
+        - !KeyOf prompt-enroll-given-name
+        - !KeyOf prompt-enroll-middle-name
         - !KeyOf prompt-enroll-email
         - !KeyOf prompt-enroll-password
         - !KeyOf prompt-enroll-password-repeat
@@ -425,7 +534,14 @@ entries:
   #   create_users_group:
   #     Ссылка на группу, в которую добавляется новый пользователь.
   #
-  # ВАЖНО ПРО type:
+  # ВАЖНО ПРО АТРИБУТЫ:
+  #   Поля attributes.family_name / attributes.given_name /
+  #   attributes.middle_name, пришедшие из prompt-стадии, попадают
+  #   в JSONB-поле user.attributes создаваемого пользователя.
+  #   Оттуда их читает кастомный scope-mapping "Uchaly: Profile Claim"
+  #   и превращает в OIDC-claims given_name / family_name /
+  #   middle_name / name.
+  #
   #   Поле type НЕ указывается в этой стадии напрямую. Оно приходит
   #   из prompt-поля prompt-enroll-type (hidden, initial_value=internal)
   #   и UserWriteStage автоматически применяет его к создаваемому
@@ -527,6 +643,13 @@ entries:
   #   diagnost       / Diagnost123!
   #   ElectroService / Service123!
   #   MexService     / Service123!
+  #
+  # ВАЖНО ПРО АТРИБУТЫ ФИО:
+  #   Тестовые пользователи тоже получают attributes.family_name /
+  #   given_name / middle_name, чтобы кастомный scope-mapping
+  #   "Uchaly: Profile Claim" корректно отдавал их в userinfo.
+  #   Поле name (единое) тоже оставляем заполненным — оно
+  #   используется в админке Authentik для отображения.
   # ============================================================
 
   # --- admin ---
@@ -535,13 +658,16 @@ entries:
     identifiers:
       username: admin
     attrs:
-      name: "System Administrator"
+      name: "Администраторов Админ Админович"
       email: "admin@uchaly.com"
       is_active: true
       is_superuser: true
       path: "users"
       type: "internal"
-      attributes: {}
+      attributes:
+        family_name: "Администраторов"
+        given_name: "Админ"
+        middle_name: "Админович"
       password: "Admin123!"
 
   # --- manager ---
@@ -550,12 +676,15 @@ entries:
     identifiers:
       username: manager
     attrs:
-      name: "John Manager"
+      name: "Менеджеров Джон Иванович"
       email: "manager@uchaly.com"
       is_active: true
       path: "users"
       type: "internal"
-      attributes: {}
+      attributes:
+        family_name: "Менеджеров"
+        given_name: "Джон"
+        middle_name: "Иванович"
       password: "Manager123!"
 
   # --- diagnost ---
@@ -564,12 +693,15 @@ entries:
     identifiers:
       username: diagnost
     attrs:
-      name: "John Diagnost"
+      name: "Диагностов Джон Иванович"
       email: "diagnost@uchaly.com"
       is_active: true
       path: "users"
       type: "internal"
-      attributes: {}
+      attributes:
+        family_name: "Диагностов"
+        given_name: "Джон"
+        middle_name: "Иванович"
       password: "Diagnost123!"
 
   # --- ElectroService ---
@@ -578,12 +710,15 @@ entries:
     identifiers:
       username: ElectroService
     attrs:
-      name: "Electro Service"
+      name: "Электросервисов Сервис Сервисович"
       email: "ElectroService@uchaly.com"
       is_active: true
       path: "users"
       type: "internal"
-      attributes: {}
+      attributes:
+        family_name: "Электросервисов"
+        given_name: "Сервис"
+        middle_name: "Сервисович"
       password: "Service123!"
 
   # --- MexService ---
@@ -592,12 +727,15 @@ entries:
     identifiers:
       username: MexService
     attrs:
-      name: "Mex Service"
+      name: "Мехсервисов Сервис Сервисович"
       email: "MexService@uchaly.com"
       is_active: true
       path: "users"
       type: "internal"
-      attributes: {}
+      attributes:
+        family_name: "Мехсервисов"
+        given_name: "Сервис"
+        middle_name: "Сервисович"
       password: "Service123!"
 
   # ============================================================
@@ -661,6 +799,16 @@ entries:
   #     authorization_code — стандартный Authorization Code Flow (PKCE),
   #                          используется нашим SPA.
   #     refresh_token      — обновление access-токена через refresh-токен.
+  #
+  # ВАЖНО ПРО property_mappings:
+  #   Здесь мы используем НЕ стандартный маппинг
+  #   "authentik default OAuth Mapping: OpenID 'profile'", а наш
+  #   собственный "Uchaly: Profile Claim" (см. выше). Причина:
+  #   стандартный маппинг извлекает given_name/family_name из
+  #   единого поля user.name (разбиением по пробелам). У нас же
+  #   ФИО хранится в user.attributes (family_name, given_name,
+  #   middle_name) — отдельными записями. Кастомный маппинг
+  #   читает их напрямую и складывает в привычные OIDC-claims.
   #
   # ПРО РЕГИСТРАЦИЮ:
   #   Поле enrollment_flow указывает на enrollment-флоу, который
@@ -727,10 +875,23 @@ entries:
       # SPA использует её же через authService.registerWithAuthentik().
       enrollment_flow: !KeyOf flow-uchaly-enrollment
 
+      # ========================================================
+      # Property mappings: каким образом заполняются claims токена.
+      #
+      # Для стандартных scope используем дефолтные маппинги Authentik:
+      #   - openid  → claim sub
+      #   - email   → claim email
+      #
+      # Для profile используем НАШ маппинг scope-profile-uchaly
+      # (см. выше) — он читает ФИО из user.attributes.
+      #
+      # Дополнительно добавляем scope-groups — наш кастомный
+      # маппинг, который кладёт в токен список групп.
+      # ========================================================
       property_mappings:
         - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'openid'"]]
         - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'email'"]]
-        - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'profile'"]]
+        - !KeyOf scope-profile-uchaly
         - !KeyOf scope-groups
       signing_key: !Find [authentik_crypto.certificatekeypair, [name, "authentik Self-signed Certificate"]]
       access_token_validity: "hours=1"
