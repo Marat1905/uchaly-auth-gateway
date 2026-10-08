@@ -1,8 +1,8 @@
 // src/types/auth.ts
 // =============================================================================
-// Типы, используемые в приложении после перехода на Keycloak.
-// UserDto — это "наша" проекция пользователя Keycloak, собранная из токена
-// и/или Admin REST API. Она НЕ совпадает с Keycloak's UserRepresentation.
+// Типы, используемые в приложении после перехода на Keycloak/Authentik.
+// UserDto — это "наша" проекция пользователя, собранная из токена
+// и/или Admin REST API. Она НЕ совпадает с Authentik's UserRepresentation.
 // =============================================================================
 
 /**
@@ -11,7 +11,7 @@
  * плюс при необходимости — из Admin REST API (id, enabled, createdTimestamp).
  */
 export interface UserDto {
-    /** Уникальный идентификатор пользователя в Keycloak (sub / id). */
+    /** Уникальный идентификатор пользователя в Authentik (sub). */
     id: string;
     /** Email. */
     email: string;
@@ -21,22 +21,46 @@ export interface UserDto {
     lastName: string;
     /** Отчество (кастомный атрибут). */
     patronymic?: string;
-    /** URL аватара (опционально, если вы храните его вне Keycloak). */
+    /** URL аватара (опционально, если вы храните его вне IdP). */
     avatarUrl?: string;
-    /** Признак активности (enabled в Keycloak). */
+    /** Признак активности (is_active). */
     isActive: boolean;
-    /** Признак удаления (в Keycloak нет мягкого удаления — всегда false). */
+    /** Признак удаления (в Authentik нет мягкого удаления — всегда false). */
     isDeleted: boolean;
-    /** Список realm-ролей пользователя. */
+    /** Список групп/ролей пользователя. */
     roles: string[];
-    /** Дата создания (из createdTimestamp / 1000). */
+    /** Дата создания (ISO-строка). */
     createdAt: string;
     /** Вычисляемое полное имя. */
     fullName: string;
 }
 
 /**
- * Запрос на создание пользователя через Keycloak Admin API.
+ * Ответ с токенами OAuth2/OIDC.
+ *
+ * idToken — ID Token из OIDC (JWT). Он нужен для:
+ *   - корректного завершения сессии Authentik (end-session),
+ *   - проверки подлинности сессии на бэкенде при необходимости.
+ */
+export interface TokenResponse {
+    accessToken: string;
+    refreshToken: string;
+    idToken: string;
+    expiresAt: string;
+    user: UserDto;
+}
+
+/**
+ * Запрос на вход (задел на будущее — на данный момент не используется,
+ * вход идёт через OAuth2-редирект).
+ */
+export interface LoginRequest {
+    username?: string;
+    password?: string;
+}
+
+/**
+ * Запрос на создание пользователя через Admin API.
  */
 export interface CreateUserRequest {
     email: string;
@@ -67,7 +91,7 @@ export interface ChangePasswordRequest {
 }
 
 /**
- * DTO роли (упрощённая проекция Keycloak RoleRepresentation).
+ * DTO роли (упрощённая проекция RoleRepresentation).
  */
 export interface RoleDto {
     id: string;
@@ -121,7 +145,7 @@ export interface UserManagementFilters {
 }
 
 /**
- * Полезная нагрузка access-токена Keycloak (то, что нам нужно).
+ * Полезная нагрузка access-токена Authentik (то, что нам нужно).
  */
 export interface KeycloakTokenPayload {
     exp: number;
@@ -141,7 +165,8 @@ export interface KeycloakTokenPayload {
     family_name?: string;
     name?: string;
     patronymic?: string;
-    /** Массив realm-ролей. */
+    /** Массив групп/ролей. */
+    groups?: string[];
     roles?: string[];
     /** Ресурсные роли (по клиентам). */
     resource_access?: Record<string, { roles: string[] }>;

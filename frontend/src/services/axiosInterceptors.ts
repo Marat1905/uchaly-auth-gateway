@@ -34,6 +34,11 @@ export const responseInterceptor = (response: AxiosResponse) => {
 
 /**
  * Интерцептор ответов: при 401 пытается обновить токен через Authentik.
+ *
+ * ВАЖНО: при неудачном refresh используется ЛОКАЛЬНЫЙ logout(),
+ * НЕ fullLogout(). Иначе мы бы отправили пользователя на end-session
+ * Authentik прямо из обработчика 401 — а это могло бы вызвать цикл
+ * редиректов, если запрос к API повторяется.
  */
 export const responseErrorInterceptor = async (error: any) => {
     const originalRequest = error.config;
@@ -58,8 +63,10 @@ export const responseErrorInterceptor = async (error: any) => {
                 return axios(originalRequest);
             } catch (refreshError) {
                 console.warn(
-                    "Не удалось обновить токен Authentik, выполняем выход."
+                    "Не удалось обновить токен Authentik, выполняем локальный выход."
                 );
+                // Локальная очистка — без редиректа на end-session,
+                // чтобы избежать зацикливания.
                 authService.logout();
                 return Promise.reject(refreshError);
             }

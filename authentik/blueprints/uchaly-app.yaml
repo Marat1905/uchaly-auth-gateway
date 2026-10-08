@@ -72,6 +72,134 @@ entries:
         }
 
   # ============================================================
+  # FLOW АВТОРИЗАЦИИ С ПОЛНОЦЕННОЙ АУТЕНТИФИКАЦИЕЙ
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   Стандартный flow "default-provider-authorization-implicit-consent"
+  #   содержит только стадию consent и НЕ содержит стадий ввода
+  #   логина/пароля. Из-за этого:
+  #
+  #   1. Параметр prompt=login, который мы шлём из фронтенда в
+  #      /application/o/authorize/, игнорируется — Authentik просто
+  #      переиспользует существующую сессию (cookie authentik_session),
+  #      если она есть.
+  #   2. Возникает "SSO-эффект": пользователь не может перелогиниться
+  #      под другой учётной записью, потому что форма входа не
+  #      показывается.
+  #
+  #   Наш flow явно требует identification → password → user_login
+  #   при КАЖДОМ запросе к /authorize/. Это заставляет Authentik
+  #   всегда показывать форму ввода логина/пароля — то есть даёт
+  #   пользователю возможность сменить пользователя.
+  #
+  # ПОЛЕ authentication:
+  #   "none" означает, что flow запускается независимо от того,
+  #   есть ли у пользователя активная сессия Authentik. Если бы
+  #   стояло "require", flow не запускался бы при наличии сессии,
+  #   и мы бы вернулись к той же проблеме.
+  # ============================================================
+  - model: authentik_flows.flow
+    id: flow-uchaly-oauth-authorize
+    identifiers:
+      slug: uchaly-oauth-authorize
+    attrs:
+      name: "Uchaly OAuth2 Authorization"
+      title: "Вход в Uchaly"
+      designation: authorization
+      authentication: none
+
+  # --- Стадия 1: identification (ввод username/email) ---
+  #
+  # Пользователь вводит свой username или email. Authentik ищет
+  # совпадение в базе и передаёт управление следующей стадии.
+  # Стадия "default-authentication-identification" создаётся
+  # автоматически при первом запуске Authentik и уже привязана
+  # к дефолтному authentication-flow. Мы просто переиспользуем её.
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-ident
+    identifiers:
+      target: !KeyOf flow-uchaly-oauth-authorize
+      stage: !Find [authentik_stages_identification.identificationstage, [name, "default-authentication-identification"]]
+      order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # --- Стадия 2: password (ввод пароля) ---
+  #
+  # Проверка пароля. Стадия "default-authentication-password"
+  # также создаётся автоматически. Здесь задаются требования к
+  # паролю (длина, сложность) и поведение при неудачных попытках.
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-pass
+    identifiers:
+      target: !KeyOf flow-uchaly-oauth-authorize
+      stage: !Find [authentik_stages_password.passwordstage, [name, "default-authentication-password"]]
+      order: 20
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # --- Стадия 3: user_login (устанавливает сессию) ---
+  #
+  # Устанавливает cookie authentik_session и редиректит
+  # пользователя обратно в flow, который его вызвал (в нашем
+  # случае — обратно в OAuth2 authorize, где будет выпущен
+  # authorization code).
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-login
+    identifiers:
+      target: !KeyOf flow-uchaly-oauth-authorize
+      stage: !Find [authentik_stages_user_login.userloginstage, [name, "default-authentication-login"]]
+      order: 30
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # ============================================================
+  # FLOW ИНВАЛИДАЦИИ (полный выход)
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   Стандартный "default-provider-invalidation-flow" рендерит
+  #   промежуточную страницу с вопросом "Вы уверены, что хотите
+  #   выйти?" и требует клика. Если пользователь не кликнет —
+  #   сессия останется живой.
+  #
+  #   Наш flow содержит ТОЛЬКО стадию user_logout без consent.
+  #   При заходе на end-session Authentik сразу инвалидирует
+  #   сессию и делает 302-редирект на post_logout_redirect_uri.
+  #
+  #   Это решает проблему, когда после "Выйти" и возврата в SPA
+  #   пользователь по кнопке "Войти" снова оказывается
+  #   залогиненным без ввода пароля — потому что сессия Authentik
+  #   не убивалась.
+  # ============================================================
+  - model: authentik_flows.flow
+    id: flow-uchaly-invalidation
+    identifiers:
+      slug: uchaly-invalidation
+    attrs:
+      name: "Uchaly Invalidation"
+      title: "Выход из Uchaly"
+      designation: invalidation
+      authentication: none
+
+  # --- Стадия logout: убивает сессию Authentik ---
+  #
+  # Стадия "default-invalidation-logout" создаётся автоматически
+  # при первом запуске Authentik. Она удаляет cookie
+  # authentik_session и завершает сессию на сервере.
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-logout
+    identifiers:
+      target: !KeyOf flow-uchaly-invalidation
+      stage: !Find [authentik_stages_user_logout.userlogoutstage, [name, "default-invalidation-logout"]]
+      order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # ============================================================
   # ТЕСТОВЫЕ ПОЛЬЗОВАТЕЛИ
   # ВНИМАНИЕ: это тестовые учётные записи для разработки.
   # Перед выводом в production — удалить или заменить на реальные.
@@ -193,6 +321,17 @@ entries:
   # ============================================================
   # OAUTH2 / OIDC ПРОВАЙДЕР
   # ВАЖНО: поле называется redirect_uris (не allowed_redirect_uris).
+  #
+  # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ:
+  #   authorization_flow теперь указывает на НАШ flow
+  #   "Uchaly OAuth2 Authorization" (см. выше), который содержит
+  #   стадии identification + password + user_login. Именно это
+  #   заставляет Authentik показывать форму логина при каждом
+  #   запросе к /authorize/, а не молча переиспользовать сессию.
+  #
+  #   invalidation_flow теперь указывает на НАШ flow
+  #   "Uchaly Invalidation", который сразу убивает сессию без
+  #   промежуточной consent-страницы.
   # ============================================================
   - model: authentik_providers_oauth2.oauth2provider
     id: provider-uchaly
@@ -214,17 +353,33 @@ entries:
           url: "http://localhost/auth/callback"
         - matching_mode: strict
           url: "http://localhost:8080/auth/callback"
+
       # ========================================================
       # Logout URIs — куда возвращать пользователя ПОСЛЕ end-session.
-      # Должны совпадать с post_logout_redirect_uri в authService.logout().
+      # Должны совпадать с post_logout_redirect_uri в authService.fullLogout().
+      #
+      # ВАЖНО: если открываешь фронт с другого порта/хоста — добавь
+      # его сюда, иначе Authentik откажется делать редирект и
+      # покажет страницу с ошибкой.
       # ========================================================
       logout_uris:
         - "http://localhost:30008/"
         - "http://localhost:62080/"
         - "http://localhost:3000/"
+        - "http://localhost:8080/"
+        - "http://localhost/"
+        - "http://10.0.9.100:62080/"
 
-      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
-      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      # ⬇⬇⬇ НАШ FLOW АВТОРИЗАЦИИ С АУТЕНТИФИКАЦИЕЙ ⬇⬇⬇
+      # Вместо default-provider-authorization-implicit-consent,
+      # который не содержит стадий ввода логина/пароля.
+      authorization_flow: !KeyOf flow-uchaly-oauth-authorize
+
+      # ⬇⬇⬇ НАШ FLOW ИНВАЛИДАЦИИ БЕЗ CONSENT ⬇⬇⬇
+      # Вместо default-provider-invalidation-flow, который
+      # показывает промежуточную страницу с вопросом.
+      invalidation_flow: !KeyOf flow-uchaly-invalidation
+
       property_mappings:
         - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'openid'"]]
         - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'email'"]]
