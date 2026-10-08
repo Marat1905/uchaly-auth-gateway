@@ -1,6 +1,196 @@
+networks:
+  uchaly_network:
+    driver: bridge
+
+volumes:
+  pgadminvol:
+  authentik_db_data:
+  authentik_redis_data:
+  authentik_media:
+  authentik_certs:
+
 services:
-  uchaly.apigateway:
-    image: ${DOCKER_REGISTRY-}uchalyapigateway
+  # ============================================================
+  # AUTHENTIK (Identity Provider)
+  # ============================================================
+  authentik-db:
+    image: postgres:17-alpine
+    container_name: authentik-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${AUTHENTIK_DB_NAME:-authentik}
+      POSTGRES_USER: ${AUTHENTIK_DB_USER:-authentik}
+      POSTGRES_PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - authentik_db_data:/var/lib/postgresql/data/pgdata
+    networks:
+      - uchaly_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUTHENTIK_DB_USER:-authentik} -d ${AUTHENTIK_DB_NAME:-authentik}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  authentik-redis:
+    image: redis:7-alpine
+    container_name: authentik-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - authentik_redis_data:/data
+    networks:
+      - uchaly_network
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Server (ядро Authentik)
+  #
+  # ВЕРСИЯ: 2026.8.3
+  # Эта версия содержит дефолтные стадии enrollment-флоу,
+  # исправления в userwritestage и актуальную схему blueprint.
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2026.8.3
+    container_name: authentik-server
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_COOKIE_SECURE: "false"
+
+      # ============================================================
+      # WHITELIST REDIRECT URL
+      #
+      # ЗАЧЕМ ЭТО НУЖНО:
+      #   Authentik по умолчанию разрешает редирект только на свой
+      #   собственный домен (localhost:9000). Если попытаться
+      #   редиректнуть пользователя на другой порт/хост (например,
+      #   в SPA на localhost:62080), Authentik вернёт ошибку
+      #   "Недопустимый следующий URL-адрес" / "Invalid next URL".
+      #
+      #   Эта переменная задаёт comma-separated список разрешённых
+      #   доменов для редиректа. Формат: схема://хост:порт
+      #   (без пути и без query-строки).
+      #
+      #   Сюда нужно добавить все порты/хосты, на которые мы
+      #   редиректим пользователя после enrollment-flow или logout:
+      #     - localhost:62080  — Vite dev server
+      #     - localhost:3000   — альтернативный dev-порт
+      #     - localhost:30008  — порт из старых тестов
+      #     - localhost:8080   — prod-like конфигурация
+      #     - localhost        — 80 порт (nginx)
+      #     - 10.0.9.100:62080 — dev на удалённой машине в сети
+      #
+      # ВАЖНО: сам Authentik (localhost:9000) добавлять НЕ нужно —
+      # он разрешён всегда автоматически.
+      #
+      # ВАЖНО 2: этот список должен совпадать со списком
+      # logout_uris в OAuth2-провайдере (uchaly-app.yaml), иначе
+      # некоторые сценарии (например, logout с редиректом на SPA)
+      # будут падать.
+      # ============================================================
+      AUTHENTIK_REDIRECT_URLS: "http://localhost:62080,http://localhost:3000,http://localhost:30008,http://localhost:8080,http://localhost,http://10.0.9.100:62080"
+
+      # Bootstrap: автоматическое создание admin-пользователя
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - authentik_media:/media
+      - authentik_certs:/certs
+      - ./authentik/blueprints:/blueprints/custom
+    ports:
+      - "${AUTHENTIK_HTTP_PORT:-9000}:9000"
+    networks:
+      - uchaly_network
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+
+  # Worker (асинхронные задачи)
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.8.3
+    container_name: authentik-worker
+    restart: unless-stopped
+    command: worker
+    environment:
+      AUTHENTIK_REDIS__HOST: authentik-redis
+      AUTHENTIK_POSTGRESQL__HOST: authentik-db
+      AUTHENTIK_POSTGRESQL__USER: ${AUTHENTIK_DB_USER:-authentik}
+      AUTHENTIK_POSTGRESQL__NAME: ${AUTHENTIK_DB_NAME:-authentik}
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+
+      # Та же переменная, что и у server — worker тоже выполняет
+      # часть задач, связанных с flow, и должен знать про whitelist.
+      AUTHENTIK_REDIRECT_URLS: "http://localhost:62080,http://localhost:3000,http://localhost:30008,http://localhost:8080,http://localhost,http://10.0.9.100:62080"
+
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - authentik_media:/media
+      - authentik_certs:/certs
+      - ./authentik/blueprints:/blueprints/custom
+    networks:
+      - uchaly_network
+    depends_on:
+      authentik-db:
+        condition: service_healthy
+      authentik-redis:
+        condition: service_healthy
+
+
+  # ============================================================
+  # API GATEWAY
+  # ============================================================
+  uchaly-apigateway:
+    image: ${DOCKER_REGISTRY-}uchaly-apigateway
     build:
       context: .
       dockerfile: src/Uchaly.APIgateway/Dockerfile
+    container_name: uchaly-apigateway
+    ports:
+      - "${GATEWAY_HTTPS_PORT}:8081"
+      - "${GATEWAY_HTTP_PORT}:8080"
+    networks:
+      - uchaly_network
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - Authentik__Authority=http://authentik-server:9000
+      - Authentik__MetadataAddress=http://authentik-server:9000/application/o/uchaly/.well-known/openid-configuration
+      - Authentik__RequireHttpsMetadata=false
+      - Authentik__ValidateIssuer=true
+      - Authentik__ValidateAudience=true
+      - Authentik__ValidateLifetime=true
+      - Authentik__ValidateIssuerSigningKey=true
+      - Authentik__ClientId=uchaly-frontend
+      - Authentik__Audience=uchaly-frontend
+    depends_on:
+      - authentik-server
+
+ 
+  uchaly-db-admin:
+    image: dpage/pgadmin4:latest
+    container_name: uchaly-db-admin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD}
+    ports:
+      - "${PGADMIN_PORT}:80"
+    volumes:
+      - pgadminvol:/var/lib/pgadmin
+    networks:
+      - uchaly_network

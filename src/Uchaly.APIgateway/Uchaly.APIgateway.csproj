@@ -4,15 +4,33 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <DockerDefaultTargetOS>Linux</DockerDefaultTargetOS>
-    <DockerfileContext>..\..</DockerfileContext>
-    <DockerComposeProjectPath>..\..\docker-compose.dcproj</DockerComposeProjectPath>
+    <RootNamespace>Uchaly.APIgateway</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.22.1" />
-    <PackageReference Include="Swashbuckle.AspNetCore" Version="10.0.1" />
+    <!-- Аутентификация JWT Bearer (Microsoft) -->
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="9.0.0" />
+
+    <!-- OpenAPI (встроенная поддержка в ASP.NET Core 9) -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="9.0.0" />
+
+    <!-- Swashbuckle: генератор OpenAPI-документа (ОТКАЧЕНО до 9.0.1 из-за бага в 9.0.2) -->
+    <PackageReference Include="Swashbuckle.AspNetCore" Version="9.0.1" />
+
+    <!-- ВАЖНО: Пакет с ресурсами Swagger UI (JS/CSS) -->
+    <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" Version="9.0.1" />
+
+    <!-- YARP Reverse Proxy -->
     <PackageReference Include="Yarp.ReverseProxy" Version="2.3.0" />
+
+    <!-- Serilog — логирование -->
+    <PackageReference Include="Serilog.AspNetCore" Version="9.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="6.0.0" />
+
+    <!-- JWT / OpenID Connect — для валидации токенов Authentik -->
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.3.0" />
+    <PackageReference Include="Microsoft.IdentityModel.Protocols.OpenIdConnect" Version="8.3.0" />
   </ItemGroup>
 
 </Project>
