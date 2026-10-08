@@ -57,6 +57,10 @@ entries:
   # ============================================================
   # PROPERTY MAPPING: добавление групп (ролей) в токен
   # Определяется до провайдера, чтобы можно было на него ссылаться.
+  #
+  # ВАЖНО ПРО user.groups:
+  #   В 2026.8.3 поле user.ak_groups объявлено deprecated. Используем
+  #   user.groups — функционально то же самое, но без warning'ов в логах.
   # ============================================================
   - model: authentik_providers_oauth2.scopemapping
     id: scope-groups
@@ -67,8 +71,8 @@ entries:
       description: "Include user groups in token"
       expression: |
         return {
-            "groups": [group.name for group in user.ak_groups.all()],
-            "roles": [group.name for group in user.ak_groups.all()]
+            "groups": [group.name for group in user.groups.all()],
+            "roles": [group.name for group in user.groups.all()]
         }
 
   # ============================================================
@@ -195,6 +199,320 @@ entries:
       target: !KeyOf flow-uchaly-invalidation
       stage: !Find [authentik_stages_user_logout.userlogoutstage, [name, "default-invalidation-logout"]]
       order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # ============================================================
+  # FLOW РЕГИСТРАЦИИ (ENROLLMENT)
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   В Authentik регистрация — это отдельный flow с designation
+  #   "enrollment". Он не встроен в OAuth2-флоу, а запускается
+  #   отдельно — по URL /if/flow/<slug>/.
+  #
+  # ВАЖНО ПРО ВЕРСИЮ:
+  #   В 2024.12 в этой системе не было дефолтных стадий
+  #   "default-enrollment-prompt" и "default-enrollment-login".
+  #   Есть только "default-source-enrollment-*" — они предназначены
+  #   для enrollment через source (LDAP/OAuth) и напрямую для
+  #   самостоятельной регистрации НЕ подходят.
+  #
+  #   Поэтому все стадии enrollment-флоу создаются ЯВНО:
+  #     1. Prompt-объекты (6 отдельных полей формы, включая
+  #        скрытое поле type=internal)
+  #     2. Prompt Stage (контейнер над полями)
+  #     3. User Write Stage (создаёт пользователя и кладёт в группу User)
+  #     4. User Login Stage (логинит после регистрации)
+  #     5. Flow (designation: enrollment)
+  #     6. FlowStageBinding × 3 (порядок: prompt → write → login)
+  #
+  # ВАЖНО ПРО IDENTIFIERS У PROMPT-ОБЪЕКТОВ:
+  #   У модели authentik_stages_prompt.prompt уникальным полем
+  #   является поле `name`, а НЕ `field_key`. Поэтому в identifiers
+  #   указывается именно `name`. Если указать `field_key`, blueprint
+  #   не найдёт существующий объект и попытается создать новый,
+  #   что упадёт на unique-constraint (Prompt with this name already
+  #   exists). Это делает применение blueprint не-идемпотентным:
+  #   первый раз проходит, второй — падает.
+  #
+  #   `field_key` при этом остаётся важным — оно уходит в attrs
+  #   и используется для маппинга значений на модель пользователя
+  #   (username/name/email/password/type).
+  #
+  # ВАЖНО ПРО type=internal:
+  #   Enrollment-flow в Authentik (включая 2026.8.3) создаёт
+  #   пользователей с типом "external" по умолчанию. Это не даёт
+  #   им заходить в /if/user/ и /if/admin/ — интерфейс Authentik
+  #   доступен только пользователям с типом "internal".
+  #
+  #   Чтобы обойти это, добавлено ШЕСТОЕ скрытое поле prompt с
+  #   field_key: type и initial_value: internal. Prompt Stage
+  #   передаёт его значение в UserWriteStage, который записывает
+  #   его в поле type новой модели пользователя.
+  #
+  #   Пользователь не видит это поле в форме — оно hidden.
+  #
+  # ВАЖНО ПРО РЕДИРЕКТ ПОСЛЕ РЕГИСТРАЦИИ:
+  #   В 2026.8.3 функция is_url_absolute (см. flows/views/executor.py)
+  #   блокирует редирект на абсолютные URL через параметр `next`.
+  #   Whitelist-механизма для внешних доменов в этой версии нет
+  #   ни в Brand, ни в Tenant.
+  #
+  #   SPA решает эту проблему, передавая в next ОТНОСИТЕЛЬНЫЙ путь
+  #   на /application/o/authorize/ — редирект на относительный URL
+  #   разрешён. Далее authorize-эндпоинт выпускает code и редиректит
+  #   на redirect_uri (уже в whitelist провайдера).
+  #
+  #   Сам enrollment-flow с этой логикой не работает — она целиком
+  #   реализована в authService.registerWithAuthentik() в SPA.
+  #
+  # ПАРАМЕТР authentication:
+  #   "none" — как и у flow авторизации, чтобы форма регистрации
+  #   открывалась независимо от активной сессии.
+  #
+  # КАК ВЫЗЫВАЕТСЯ ИЗ SPA:
+  #   authService.registerWithAuthentik() редиректит браузер на
+  #   /if/flow/uchaly-enrollment/?next=<относительный OAuth2-authorize URL>.
+  # ============================================================
+
+  # --- Prompt-объекты: отдельные поля формы регистрации ---
+  #
+  # Каждое поле — это отдельная запись модели authentik_stages_prompt.prompt.
+  # Поле field_key — это внутренний идентификатор поля, который потом
+  # используется при маппинге значений на модель пользователя.
+  # Для username/name/email/password/type Authentik мапит автоматически
+  # по именам полей.
+  #
+  # ПОЛЕ order: определяет порядок полей в UI-форме.
+  #
+  # ПОЛЕ type: тип поля формы. Доступные типы:
+  #   - text      — обычная текстовая строка
+  #   - username  — с валидацией username (буквы, цифры, @ . + - _)
+  #   - email     — с валидацией email
+  #   - password  — скрытое поле с индикатором сложности
+  #   - number    — число
+  #   - checkbox  — галочка
+  #   - hidden    — скрытое поле (передаётся с формой, но не отображается)
+  #   - static    — статический текст
+  #   - redirect  — кнопка-редирект
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-username
+    identifiers:
+      name: "Uchaly Enrollment Username"
+    attrs:
+      field_key: username
+      label: "Имя пользователя"
+      type: username
+      required: true
+      placeholder: "Введите логин"
+      order: 10
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-name
+    identifiers:
+      name: "Uchaly Enrollment Name"
+    attrs:
+      field_key: name
+      label: "Полное имя"
+      type: text
+      required: true
+      placeholder: "Иван Иванов"
+      order: 20
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-email
+    identifiers:
+      name: "Uchaly Enrollment Email"
+    attrs:
+      field_key: email
+      label: "Email"
+      type: email
+      required: true
+      placeholder: "user@uchaly.com"
+      order: 30
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-password
+    identifiers:
+      name: "Uchaly Enrollment Password"
+    attrs:
+      field_key: password
+      label: "Пароль"
+      type: password
+      required: true
+      placeholder: "Введите пароль"
+      order: 40
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-password-repeat
+    identifiers:
+      name: "Uchaly Enrollment Password Repeat"
+    attrs:
+      field_key: password_repeat
+      label: "Повторите пароль"
+      type: password
+      required: true
+      placeholder: "Повторите пароль"
+      order: 50
+
+  # --- Скрытый prompt: принудительно ставит type=internal ---
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   В Authentik (включая 2026.8.3) enrollment-flow создаёт
+  #   пользователей с типом "external". Это не даёт им заходить
+  #   в /if/user/ и /if/admin/.
+  #
+  #   Скрытое поле с field_key: type и initial_value: internal
+  #   заставляет Prompt Stage передать в UserWriteStage значение
+  #   "internal". UserWriteStage записывает его в атрибут type
+  #   новой модели пользователя.
+  #
+  # ВАЖНО: тип hidden означает, что пользователь не видит это поле
+  # в форме — оно передаётся невидимо.
+  - model: authentik_stages_prompt.prompt
+    id: prompt-enroll-type
+    identifiers:
+      name: "Uchaly Enrollment Type"
+    attrs:
+      field_key: type
+      label: "User Type"
+      type: hidden
+      required: false
+      initial_value: "internal"
+      order: 60
+
+  # --- Prompt Stage: контейнер, объединяющий все поля формы ---
+  #
+  # ВАЖНО: поля перечисляем через !KeyOf на созданные выше prompt-объекты.
+  # Порядок в UI определяется полем order в каждом prompt.
+  #
+  # ПОЛЕ validation_policies: список policy-объектов, которые
+  # дополнительно проверяют корректность введённых данных.
+  # Мы оставляем пустым — встроенных валидаторов (required, type)
+  # достаточно для базовой регистрации.
+  - model: authentik_stages_prompt.promptstage
+    id: stage-enroll-prompt
+    identifiers:
+      name: "Uchaly Enrollment Prompt"
+    attrs:
+      fields:
+        - !KeyOf prompt-enroll-username
+        - !KeyOf prompt-enroll-name
+        - !KeyOf prompt-enroll-email
+        - !KeyOf prompt-enroll-password
+        - !KeyOf prompt-enroll-password-repeat
+        - !KeyOf prompt-enroll-type
+      validation_policies: []
+
+  # --- User Write Stage: создаёт пользователя и кладёт в группу User ---
+  #
+  # Это НАША собственная стадия (не default), потому что нам нужно
+  # сразу поместить нового пользователя в группу "User". Иначе
+  # он не увидит приложение Uchaly — policy bindings в конце
+  # файла разрешают доступ только членам перечисленных групп.
+  #
+  # ПОЛЯ:
+  #   user_creation_mode:
+  #     "always_create"    — всегда создавать нового пользователя.
+  #     Альтернативы: "never_create" (только обновление) или
+  #     "create_when_required" (создавать только если пользователя
+  #     нет; если есть — обновлять).
+  #   create_users_as_inactive:
+  #     "false" — сразу активные. Если поставить "true", то после
+  #     регистрации пользователь будет неактивен, и админ должен
+  #     его активировать вручную.
+  #   create_users_group:
+  #     Ссылка на группу, в которую добавляется новый пользователь.
+  #
+  # ВАЖНО ПРО type:
+  #   Поле type НЕ указывается в этой стадии напрямую. Оно приходит
+  #   из prompt-поля prompt-enroll-type (hidden, initial_value=internal)
+  #   и UserWriteStage автоматически применяет его к создаваемому
+  #   пользователю.
+  - model: authentik_stages_user_write.userwritestage
+    id: stage-enroll-user-write
+    identifiers:
+      name: "Uchaly Enrollment User Write"
+    attrs:
+      user_creation_mode: always_create
+      create_users_as_inactive: false
+      create_users_group: !KeyOf group-user
+
+  # --- User Login Stage: логинит пользователя после регистрации ---
+  #
+  # Устанавливает cookie authentik_session и редиректит пользователя
+  # на URL из параметра `next` (или на дефолтную страницу, если
+  # next не передан).
+  #
+  # ПОЛЕ session_duration:
+  #   "seconds=0" — использовать дефолтную длительность сессии
+  #   Authentik (обычно 12 часов).
+  #
+  # ВАЖНО: SPA передаёт относительный next, указывающий на
+  # OAuth2-authorize URL. Это обходит проверку is_url_absolute,
+  # и пользователь после регистрации автоматически попадает
+  # в SPA уже аутентифицированным.
+  - model: authentik_stages_user_login.userloginstage
+    id: stage-enroll-login
+    identifiers:
+      name: "Uchaly Enrollment Login"
+    attrs:
+      session_duration: "seconds=0"
+
+  # --- Flow: сам enrollment-флоу ---
+  #
+  # designation: enrollment — это ключевое поле, которое говорит
+  # Authentik, что данный flow предназначен для регистрации.
+  # Именно поэтому он доступен по URL /if/flow/<slug>/ без
+  # предварительной аутентификации.
+  - model: authentik_flows.flow
+    id: flow-uchaly-enrollment
+    identifiers:
+      slug: uchaly-enrollment
+    attrs:
+      name: "Uchaly Registration"
+      title: "Регистрация в Uchaly"
+      designation: enrollment
+      authentication: none
+
+  # --- Привязки стадий к флоу (порядок важен) ---
+  #
+  # Порядок определяется полем order:
+  #   order: 10 — Prompt Stage (сначала спрашиваем данные)
+  #   order: 20 — User Write Stage (потом создаём пользователя)
+  #   order: 30 — User Login Stage (потом логиним)
+  #
+  # ВАЖНО: редирект после регистрации делает не отдельная стадия,
+  # а параметр next в URL enrollment-flow. SPA передаёт туда
+  # относительный путь на OAuth2-authorize — это обходит проверку
+  # is_url_absolute в 2026.8.3.
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-enroll-prompt
+    identifiers:
+      target: !KeyOf flow-uchaly-enrollment
+      stage: !KeyOf stage-enroll-prompt
+      order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-enroll-write
+    identifiers:
+      target: !KeyOf flow-uchaly-enrollment
+      stage: !KeyOf stage-enroll-user-write
+      order: 20
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-enroll-login
+    identifiers:
+      target: !KeyOf flow-uchaly-enrollment
+      stage: !KeyOf stage-enroll-login
+      order: 30
     attrs:
       evaluate_on_plan: true
       re_evaluate_policies: false
@@ -332,6 +650,23 @@ entries:
   #   invalidation_flow теперь указывает на НАШ flow
   #   "Uchaly Invalidation", который сразу убивает сессию без
   #   промежуточной consent-страницы.
+  #
+  # ВАЖНО ПРО grant_types (2026.8.3+):
+  #   Начиная с 2026.8 у OAuth2Provider появилось обязательное поле
+  #   grant_types. Если оно пустое — провайдер отвергает все
+  #   authorize-запросы с ошибкой "Invalid grant_type for provider",
+  #   а SPA получает "invalid_request: The request is otherwise malformed".
+  #
+  #   Нужно явно указать:
+  #     authorization_code — стандартный Authorization Code Flow (PKCE),
+  #                          используется нашим SPA.
+  #     refresh_token      — обновление access-токена через refresh-токен.
+  #
+  # ПРО РЕГИСТРАЦИЮ:
+  #   Поле enrollment_flow указывает на enrollment-флоу, который
+  #   используется для регистрации. Authentik показывает ссылку
+  #   "Sign up" на странице входа, ведущую в этот флоу. Наш SPA
+  #   использует её же через authService.registerWithAuthentik().
   # ============================================================
   - model: authentik_providers_oauth2.oauth2provider
     id: provider-uchaly
@@ -340,6 +675,17 @@ entries:
     attrs:
       client_type: public
       client_id: uchaly-frontend
+
+      # ========================================================
+      # Разрешённые grant types для OAuth2.
+      #
+      # В 2026.8.3 поле обязательно: без него провайдер отвергает
+      # authorize-запросы с ошибкой "Invalid grant_type for provider".
+      # ========================================================
+      grant_types:
+        - authorization_code
+        - refresh_token
+
       redirect_uris:
         - matching_mode: strict
           url: "http://localhost:62080/auth/callback"
@@ -357,10 +703,6 @@ entries:
       # ========================================================
       # Logout URIs — куда возвращать пользователя ПОСЛЕ end-session.
       # Должны совпадать с post_logout_redirect_uri в authService.fullLogout().
-      #
-      # ВАЖНО: если открываешь фронт с другого порта/хоста — добавь
-      # его сюда, иначе Authentik откажется делать редирект и
-      # покажет страницу с ошибкой.
       # ========================================================
       logout_uris:
         - "http://localhost:30008/"
@@ -379,6 +721,11 @@ entries:
       # Вместо default-provider-invalidation-flow, который
       # показывает промежуточную страницу с вопросом.
       invalidation_flow: !KeyOf flow-uchaly-invalidation
+
+      # ⬇⬇⬇ НАШ FLOW РЕГИСТРАЦИИ ⬇⬇⬇
+      # Ссылка "Sign up" на странице логина ведёт в этот флоу.
+      # SPA использует её же через authService.registerWithAuthentik().
+      enrollment_flow: !KeyOf flow-uchaly-enrollment
 
       property_mappings:
         - !Find [authentik_providers_oauth2.scopemapping, [name, "authentik default OAuth Mapping: OpenID 'openid'"]]

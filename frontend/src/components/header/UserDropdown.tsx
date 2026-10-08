@@ -7,7 +7,7 @@ import { useAuth } from "../../context/AuthContext";
 
 export default function UserDropdown() {
     const [isOpen, setIsOpen] = useState(false);
-    const { user, isAuthenticated, logout, openAccountConsole } = useAuth();
+    const { user, isAuthenticated, logout, register, openAccountConsole } = useAuth();
     const navigate = useNavigate();
 
     function toggleDropdown() {
@@ -24,9 +24,23 @@ export default function UserDropdown() {
         navigate('/');
     };
 
-    const handleRegister = () => {
+    /**
+     * Запускает регистрацию нового пользователя в Authentik.
+     *
+     * Раньше здесь был navigate('/register') — внутренний маршрут SPA.
+     * Теперь мы вызываем register() из AuthContext, который через
+     * authService.registerWithAuthentik() редиректит браузер
+     * НАПРЯМУЮ на /if/flow/uchaly-enrollment/ в Authentik — минуя
+     * промежуточную страницу /register. Так короче и логичнее:
+     * пользователь сразу видит форму регистрации.
+     */
+    const handleRegister = async () => {
         closeDropdown();
-        navigate('/register');
+        try {
+            await register();
+        } catch (error) {
+            console.error('[UserDropdown] Не удалось запустить регистрацию:', error);
+        }
     };
 
     const handleLogin = () => {

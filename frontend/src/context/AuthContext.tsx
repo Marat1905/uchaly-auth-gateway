@@ -16,6 +16,7 @@ import type { UserDto } from "../types/auth";
  * Убраны все вызовы кастомного Identity (login/refresh/revoke).
  * Теперь:
  * - login() выполняет редирект на Authentik.
+ * - register() выполняет редирект на страницу регистрации Authentik.
  * - logout() выполняет редирект на end-session Authentik.
  * - Профиль пользователя приходит из userinfo Authentik.
  */
@@ -42,6 +43,18 @@ interface AuthContextType {
 
     /** Запускает OAuth2-редирект на Authentik. */
     login: () => Promise<void>;
+
+    /**
+     * Запускает редирект на enrollment-флоу Authentik —
+     * страницу регистрации нового пользователя.
+     *
+     * В отличие от login(), здесь НЕ используется OAuth2 — это
+     * отдельный HTML-интерфейс Authentik. После успешной регистрации
+     * пользователь попадёт обратно в SPA (на /login?registered=true),
+     * где сможет войти со своими новыми учётными данными.
+     */
+    register: () => Promise<void>;
+
     logout: () => void;
     refreshUser: () => Promise<void>;
     loading: boolean;
@@ -165,6 +178,18 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         await authService.loginWithAuthentik();
     };
 
+    /**
+     * Запускает редирект на страницу регистрации Authentik.
+     *
+     * Не путать с login(): login() идёт через OAuth2 authorize endpoint
+     * и возвращается на /auth/callback с code/state. register() идёт
+     * напрямую на /if/flow/uchaly-enrollment/ и возвращается на
+     * /login?registered=true (URL задаётся в authService).
+     */
+    const register = async () => {
+        await authService.registerWithAuthentik();
+    };
+
     const logout = () => {
         authService.logout();
         setUser(null);
@@ -200,6 +225,7 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         setTestRole,
         cycleTestRole,
         login,
+        register,
         logout,
         refreshUser,
         loading,

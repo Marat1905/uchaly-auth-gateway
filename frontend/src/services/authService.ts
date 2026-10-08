@@ -6,6 +6,11 @@
  * Что делает:
  *   - loginWithAuthentik() — запускает OAuth2 Authorization Code Flow с PKCE,
  *     редиректит браузер на страницу входа Authentik.
+ *   - registerWithAuthentik() — запускает регистрацию нового пользователя
+ *     через enrollment-flow Authentik. После успешной регистрации
+ *     пользователь автоматически попадает обратно в SPA уже аутентифицированным
+ *     (за счёт того, что next указывает на OAuth2-authorize URL, который
+ *     выпускает code и редиректит на redirect_uri).
  *   - handleCallback(code, state) — обменивает authorization code на токены,
  *     загружает профиль пользователя и сохраняет всё в localStorage.
  *   - refreshToken() — обновляет access-токен через refresh-токен.
@@ -53,6 +58,13 @@ const AUTHENTIK_BASE_URL =
 const AUTHENTIK_APP_SLUG = "uchaly";
 
 /**
+ * Slug enrollment-флоу, определённого в blueprint (uchaly-app.yaml).
+ * Используется в registerWithAuthentik() для построения URL страницы
+ * регистрации: /if/flow/<slug>/
+ */
+const ENROLLMENT_FLOW_SLUG = "uchaly-enrollment";
+
+/**
  * Client ID, настроенный в OAuth2-провайдере Authentik.
  */
 const CLIENT_ID = "uchaly-frontend";
@@ -75,6 +87,15 @@ const AUTHORIZE_URL = `${AUTHENTIK_BASE_URL}/application/o/authorize/`;
 const TOKEN_URL = `${AUTHENTIK_BASE_URL}/application/o/token/`;
 const USERINFO_URL = `${AUTHENTIK_BASE_URL}/application/o/userinfo/`;
 const END_SESSION_URL = `${AUTHENTIK_BASE_URL}/application/o/${AUTHENTIK_APP_SLUG}/end-session/`;
+
+/**
+ * URL enrollment-флоу (страница регистрации).
+ *
+ * ВНИМАНИЕ: это URL самого интерфейса Authentik, а не OAuth2-эндпоинт.
+ * Он открывается в браузере как обычная HTML-страница и после
+ * завершения флоу редиректит пользователя на URL из параметра `next`.
+ */
+const ENROLLMENT_URL = `${AUTHENTIK_BASE_URL}/if/flow/${ENROLLMENT_FLOW_SLUG}/`;
 
 // ============================================================
 // OAUTH2 SCOPES
@@ -202,6 +223,82 @@ export const authService = {
 
         // 5. Редирект на Authentik
         window.location.href = `${AUTHORIZE_URL}?${params.toString()}`;
+    },
+
+    // ==========================================================
+    // РЕГИСТРАЦИЯ (ENROLLMENT FLOW + OIDC-возврат в SPA)
+    // ==========================================================
+
+    /**
+     * Запускает регистрацию нового пользователя через enrollment-flow
+     * Authentik, с автоматическим возвратом в SPA после успеха.
+     *
+     * АРХИТЕКТУРНОЕ РЕШЕНИЕ (важно для понимания):
+     *
+     *   В Authentik 2026.8.3 функция is_url_absolute (см.
+     *   flows/views/executor.py) блокирует редирект на абсолютные URL
+     *   через параметр `next`. Whitelist-механизма для внешних доменов
+     *   в этой версии нет ни в Brand, ни в Tenant.
+     *
+     *   Прямой next=http://localhost:62080/login?registered=true
+     *   отклоняется с ошибкой "Invalid next URL".
+     *
+     *   ОБХОД: используем ОТНОСИТЕЛЬНЫЙ next, указывающий на
+     *   OAuth2-authorize URL. is_url_absolute для относительного пути
+     *   возвращает False, редирект разрешён. Далее authorize-эндпоинт
+     *   видит, что пользователь уже залогинен (enrollment-flow его
+     *   залогинил), выпускает authorization code и редиректит
+     *   на redirect_uri — который уже в whitelist провайдера.
+     *
+     * ПОТОК:
+     *   1. SPA генерирует PKCE и state (как для обычного логина).
+     *   2. Редирект на /if/flow/uchaly-enrollment/?next=/application/o/authorize/?...
+     *   3. Пользователь заполняет форму, Authentik создаёт его.
+     *   4. enrollment-flow редиректит на относительный next.
+     *   5. authorize-эндпоинт видит активную сессию, выпускает code.
+     *   6. Редирект на http://localhost:62080/auth/callback?code=...
+     *   7. SPA обрабатывает callback в AuthCallback → токены сохранены.
+     *   8. Пользователь автоматически в главном меню приложения.
+     */
+    async registerWithAuthentik(): Promise<void> {
+        // 1. Генерируем PKCE verifier и challenge — они понадобятся
+        //    на шаге 7, когда SPA будет обменивать code на токены.
+        const codeVerifier = generateRandomString(64);
+        const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+        // 2. Генерируем state для CSRF-защиты.
+        const state = generateRandomString(32);
+
+        // 3. Сохраняем verifier и state — проверим их в handleCallback.
+        sessionStorage.setItem(STORAGE_KEYS.pkceVerifier, codeVerifier);
+        sessionStorage.setItem(STORAGE_KEYS.oauthState, state);
+
+        // 4. Формируем параметры OAuth2-authorize URL.
+        //    Этот URL будет передан в enrollment-flow как `next`.
+        const authorizeParams = new URLSearchParams({
+            client_id: CLIENT_ID,
+            redirect_uri: REDIRECT_URI,
+            response_type: "code",
+            scope: OAUTH_SCOPES,
+            state,
+            code_challenge: codeChallenge,
+            code_challenge_method: "S256",
+        });
+
+        // 5. ВАЖНО: URL ОТНОСИТЕЛЬНЫЙ — начинается с /.
+        //    Именно это позволяет обойти проверку is_url_absolute
+        //    в Authentik. Абсолютный URL (http://...) был бы отклонён.
+        const authorizePath = `/application/o/authorize/?${authorizeParams.toString()}`;
+
+        // 6. Формируем URL enrollment-flow с next=authorizePath.
+        //    Тоже относительный URL от корня Authentik.
+        const enrollParams = new URLSearchParams({
+            next: authorizePath,
+        });
+
+        // 7. Редирект на enrollment-flow. Дальше Authentik сам
+        //    проведёт пользователя по всей цепочке до callback в SPA.
+        window.location.href = `${ENROLLMENT_URL}?${enrollParams.toString()}`;
     },
 
     /**

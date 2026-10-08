@@ -46,8 +46,12 @@ services:
       retries: 5
 
   # Server (ядро Authentik)
+  #
+  # ВЕРСИЯ: 2026.8.3
+  # Эта версия содержит дефолтные стадии enrollment-флоу,
+  # исправления в userwritestage и актуальную схему blueprint.
   authentik-server:
-    image: ghcr.io/goauthentik/server:2024.12
+    image: ghcr.io/goauthentik/server:2026.8.3
     container_name: authentik-server
     restart: unless-stopped
     command: server
@@ -60,6 +64,40 @@ services:
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
       AUTHENTIK_COOKIE_SECURE: "false"
+
+      # ============================================================
+      # WHITELIST REDIRECT URL
+      #
+      # ЗАЧЕМ ЭТО НУЖНО:
+      #   Authentik по умолчанию разрешает редирект только на свой
+      #   собственный домен (localhost:9000). Если попытаться
+      #   редиректнуть пользователя на другой порт/хост (например,
+      #   в SPA на localhost:62080), Authentik вернёт ошибку
+      #   "Недопустимый следующий URL-адрес" / "Invalid next URL".
+      #
+      #   Эта переменная задаёт comma-separated список разрешённых
+      #   доменов для редиректа. Формат: схема://хост:порт
+      #   (без пути и без query-строки).
+      #
+      #   Сюда нужно добавить все порты/хосты, на которые мы
+      #   редиректим пользователя после enrollment-flow или logout:
+      #     - localhost:62080  — Vite dev server
+      #     - localhost:3000   — альтернативный dev-порт
+      #     - localhost:30008  — порт из старых тестов
+      #     - localhost:8080   — prod-like конфигурация
+      #     - localhost        — 80 порт (nginx)
+      #     - 10.0.9.100:62080 — dev на удалённой машине в сети
+      #
+      # ВАЖНО: сам Authentik (localhost:9000) добавлять НЕ нужно —
+      # он разрешён всегда автоматически.
+      #
+      # ВАЖНО 2: этот список должен совпадать со списком
+      # logout_uris в OAuth2-провайдере (uchaly-app.yaml), иначе
+      # некоторые сценарии (например, logout с редиректом на SPA)
+      # будут падать.
+      # ============================================================
+      AUTHENTIK_REDIRECT_URLS: "http://localhost:62080,http://localhost:3000,http://localhost:30008,http://localhost:8080,http://localhost,http://10.0.9.100:62080"
+
       # Bootstrap: автоматическое создание admin-пользователя
       AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
       AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
@@ -80,7 +118,7 @@ services:
 
   # Worker (асинхронные задачи)
   authentik-worker:
-    image: ghcr.io/goauthentik/server:2024.12
+    image: ghcr.io/goauthentik/server:2026.8.3
     container_name: authentik-worker
     restart: unless-stopped
     command: worker
@@ -92,6 +130,11 @@ services:
       AUTHENTIK_POSTGRESQL__PASSWORD: ${AUTHENTIK_DB_PASSWORD}
       AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
       AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+
+      # Та же переменная, что и у server — worker тоже выполняет
+      # часть задач, связанных с flow, и должен знать про whitelist.
+      AUTHENTIK_REDIRECT_URLS: "http://localhost:62080,http://localhost:3000,http://localhost:30008,http://localhost:8080,http://localhost,http://10.0.9.100:62080"
+
       AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
       AUTHENTIK_BOOTSTRAP_TOKEN: ${AUTHENTIK_BOOTSTRAP_TOKEN}
       AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}

@@ -8,11 +8,17 @@ import PageMeta from "../../components/common/PageMeta";
  * Страница входа.
  * Вместо собственной формы email/пароль — редирект на Authentik.
  * Если пользователь уже аутентифицирован — редирект на главную.
+ *
+ * Дополнительно обрабатывает query-параметр ?registered=true,
+ * который приходит после успешного завершения enrollment-flow
+ * (см. authService.registerWithAuthentik). В этом случае показывается
+ * зелёное сообщение об успешной регистрации.
  */
 const Login: React.FC = () => {
     const { login, isAuthenticated, loading: authLoading } = useAuth();
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
+    const [successMessage, setSuccessMessage] = useState("");
     const navigate = useNavigate();
     const location = useLocation();
 
@@ -31,9 +37,32 @@ const Login: React.FC = () => {
         }
     }, [location]);
 
+    /**
+     * Обрабатываем query-параметр ?registered=true.
+     *
+     * Этот флаг приходит от Authentik, когда пользователь успешно
+     * завершил enrollment-flow: UserLoginStage редиректит его на
+     * URL из параметра next, который мы установили как
+     * `${origin}/login?registered=true`.
+     *
+     * После показа сообщения вычищаем параметр из URL через
+     * navigate(replace), чтобы при F5 сообщение не появлялось повторно.
+     */
+    useEffect(() => {
+        const params = new URLSearchParams(location.search);
+        if (params.get("registered") === "true") {
+            setSuccessMessage(
+                "Регистрация прошла успешно! Теперь вы можете войти, используя указанные при регистрации данные."
+            );
+            // Убираем query-параметр из URL, чтобы F5 не повторял сообщение.
+            navigate(location.pathname, { replace: true });
+        }
+    }, [location.search, location.pathname, navigate]);
+
     const handleLogin = async () => {
         setLoading(true);
         setError("");
+        setSuccessMessage("");
 
         try {
             // Редирект на Authentik
@@ -83,6 +112,29 @@ const Login: React.FC = () => {
                             Войдите через корпоративную систему аутентификации Authentik
                         </p>
                     </div>
+
+                    {successMessage && (
+                        <div className="mt-6 rounded-xl bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 p-4">
+                            <div className="flex items-start gap-2">
+                                <svg
+                                    className="w-5 h-5 text-green-600 dark:text-green-400 flex-shrink-0 mt-0.5"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    viewBox="0 0 24 24"
+                                >
+                                    <path
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                        strokeWidth={2}
+                                        d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                                    />
+                                </svg>
+                                <p className="text-sm font-medium text-green-800 dark:text-green-200">
+                                    {successMessage}
+                                </p>
+                            </div>
+                        </div>
+                    )}
 
                     {error && (
                         <div className="mt-6 rounded-xl bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 p-4">
@@ -142,7 +194,16 @@ const Login: React.FC = () => {
                             )}
                         </button>
 
-                        <div className="text-center">
+                        <div className="text-center space-y-3">
+                            <p className="text-sm text-gray-600 dark:text-gray-400">
+                                Нет учётной записи?{" "}
+                                <Link
+                                    to="/register"
+                                    className="font-semibold text-brand-600 hover:text-brand-700 dark:text-brand-400 dark:hover:text-brand-300"
+                                >
+                                    Зарегистрироваться
+                                </Link>
+                            </p>
                             <p className="text-xs text-gray-500 dark:text-gray-400">
                                 Нажимая кнопку, вы будете перенаправлены на страницу входа
                                 корпоративной системы аутентификации.
