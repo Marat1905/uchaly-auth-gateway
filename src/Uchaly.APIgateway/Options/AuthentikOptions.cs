@@ -1,7 +1,8 @@
 ﻿namespace Uchaly.APIgateway.Options;
 
 /// <summary>
-/// Опции подключения к Authentik как OAuth2/OIDC-провайдеру.
+/// Опции подключения к Authentik как OAuth2/OIDC-провайдеру
+/// и как Admin API для управления пользователями.
 /// Секция конфигурации: "Authentik"
 /// </summary>
 public class AuthentikOptions
@@ -14,6 +15,7 @@ public class AuthentikOptions
     /// <summary>
     /// Базовый URL инстанса Authentik (например, http://authentik-server:9000
     /// внутри Docker-сети или https://auth.uchaly.com снаружи).
+    /// Используется и для OIDC-валидации, и для вызовов Admin API.
     /// </summary>
     public string Authority { get; set; } = string.Empty;
 
@@ -84,4 +86,25 @@ public class AuthentikOptions
     /// URL страницы логина фронтенда (куда редиректить неавторизованных).
     /// </summary>
     public string FrontendLoginUrl { get; set; } = "/login";
+
+    /// <summary>
+    /// Токен сервисной учётной записи Authentik для вызовов Admin API.
+    ///
+    /// ЗАЧЕМ ЭТО НУЖНО:
+    ///   Пользовательский access-токен, выпущенный для публичного клиента
+    ///   "uchaly-frontend", НЕ имеет прав на изменение пользовательских
+    ///   данных через Admin API Authentik. Для операций редактирования
+    ///   профиля и смены пароля Gateway использует отдельный сервисный
+    ///   токен, у которого есть права суперпользователя.
+    ///
+    /// ГДЕ ВЗЯТЬ:
+    ///   В dev-окружении используется AUTHENTIK_BOOTSTRAP_TOKEN,
+    ///   который автоматически создаётся при первом старте Authentik
+    ///   и пробрасывается в контейнер через docker-compose.
+    ///
+    /// ВАЖНО:
+    ///   Токен — секрет. Никогда не должен попадать на фронтенд.
+    ///   Все вызовы Admin API идут ТОЛЬКО с серверной части Gateway.
+    /// </summary>
+    public string AdminToken { get; set; } = string.Empty;
 }
