@@ -49,6 +49,26 @@
 //
 //      Это подтверждено логами: ручной curl с Content-Length
 //      возвращает 204, а PostAsJsonAsync — 400.
+//
+//   8. FULLNAME ИЗ АТРИБУТОВ:
+//      Enrollment-flow (см. uchaly-app.yaml) сохраняет ФИО
+//      пользователя в трёх отдельных атрибутах:
+//      attributes.family_name / given_name / middle_name.
+//      Единое поле user.name при этом остаётся ПУСТЫМ.
+//
+//      Поэтому в MapUser FullName собирается сначала из этих
+//      трёх атрибутов в порядке "Фамилия Имя Отчество",
+//      и только если их нет — падаем на u.Name, а затем
+//      на username. Иначе у всех зарегистрированных через
+//      SPA пользователей в админке показывался бы username
+//      вместо реального ФИО.
+//
+//   9. DESCRIPTION У ГРУППЫ:
+//      В Authentik у группы нет отдельного поля description.
+//      Мы храним описание в attributes.description (JSONB).
+//      При создании/обновлении группы запаковываем description
+//      в attributes, при чтении — извлекаем через
+//      GetAttrString(g.Attributes, "description").
 // =============================================================================
 
 using System.Net;
@@ -637,9 +657,7 @@ public class AuthentikAdminClient : IAuthentikAdminClient
                 jsonBody, Encoding.UTF8, "application/json");
 
             // Диагностический лог: покажем, что именно отправляем.
-            // Удобно при отладке, безопасно при проде (WRN попадёт
-            // в консоль только при явных сбоях, потому что при 204
-            // этот лог не срабатывает — мы логируем только ошибки).
+            // Уровень Debug — не шумит в проде.
             _logger.LogDebug(
                 "Authentik admin: add_user POST body={Body} (Pk={Pk})",
                 jsonBody, body.Pk);
@@ -758,9 +776,22 @@ public class AuthentikAdminClient : IAuthentikAdminClient
     public async Task<AdminGroupDto> CreateGroupAsync(
         CreateGroupRequest request, CancellationToken ct = default)
     {
+        // В Authentik у группы НЕТ отдельного поля description.
+        // Описание храним в attributes.description (JSONB).
+        // Если description передан — кладём его в attributes.
+        Dictionary<string, object>? attributes = null;
+        if (request.Description is not null)
+        {
+            attributes = new Dictionary<string, object>
+            {
+                ["description"] = request.Description,
+            };
+        }
+
         var body = new AuthentikCreateGroupRequest
         {
             Name = request.Name,
+            Attributes = attributes,
             IsSuperuser = request.IsSuperuser,
             Parent = request.Parent,
         };
@@ -795,9 +826,27 @@ public class AuthentikAdminClient : IAuthentikAdminClient
     public async Task<AdminGroupDto> UpdateGroupAsync(
         string id, UpdateGroupRequest request, CancellationToken ct = default)
     {
+        // В Authentik у группы НЕТ отдельного поля description.
+        // Описание храним в attributes.description (JSONB).
+        // Если description передан — кладём его в attributes.
+        //
+        // ВАЖНО: Authentik при PATCH с attributes ЗАМЕНЯЕТ
+        // весь JSONB-объект, а не мержит отдельные ключи.
+        // У нас в attributes только description, поэтому
+        // потери данных не будет.
+        Dictionary<string, object>? attributes = null;
+        if (request.Description is not null)
+        {
+            attributes = new Dictionary<string, object>
+            {
+                ["description"] = request.Description,
+            };
+        }
+
         var patch = new AuthentikPatchGroupRequest
         {
             Name = request.Name,
+            Attributes = attributes,
             IsSuperuser = request.IsSuperuser,
             Parent = request.Parent,
         };
@@ -877,6 +926,35 @@ public class AuthentikAdminClient : IAuthentikAdminClient
     ///      Формат: "Фамилия Имя Отчество".
     ///   3. Если name пустой — всё пустое, fullName = username.
     ///
+    /// ВАЖНО ПРО FullName:
+    ///   Есть три источника ФИО в порядке приоритета:
+    ///
+    ///   1. Отдельные поля attributes.family_name/given_name/
+    ///      middle_name — их заполняет enrollment-flow
+    ///      (см. uchaly-app.yaml). Именно они есть у всех
+    ///      пользователей, зарегистрированных через SPA.
+    ///
+    ///   2. Единое поле user.name — его заполняет blueprint
+    ///      для seed-пользователей (admin, manager и т. д.)
+    ///      и админ при ручном создании через Admin API.
+    ///
+    ///   3. Username — fallback, если ни ФИО, ни name нет.
+    ///
+    ///   РАНЬШЕ БЫЛА ОШИБКА:
+    ///     FullName = string.IsNullOrWhiteSpace(u.Name)
+    ///         ? u.Username
+    ///         : u.Name
+    ///
+    ///   Для enrollment-пользователей u.Name пустой, поэтому
+    ///   в UI показывался username ("Marat1905") вместо
+    ///   "Гафаров Марат Фатихович".
+    ///
+    ///   ТЕПЕРЬ:
+    ///     Сначала пробуем собрать ФИО из отдельных атрибутов
+    ///     в русском порядке "Фамилия Имя Отчество". Если
+    ///     атрибутов нет — падаем на u.Name, а затем на
+    ///     username.
+    ///
     /// ВАЖНО ПРО Id:
     ///   В публичное поле Id кладём ЧИСЛОВОЙ pk пользователя
     ///   (в виде строки), потому что Authentik Admin API на
@@ -898,6 +976,8 @@ public class AuthentikAdminClient : IAuthentikAdminClient
         var middle = GetAttrString(u.Attributes, "middle_name");
 
         // Fallback — разбить user.name по пробелам.
+        // Используется, только если отдельных атрибутов нет
+        // (например, у seed-пользователей из blueprint).
         if (string.IsNullOrEmpty(given)
             && string.IsNullOrEmpty(family)
             && !string.IsNullOrWhiteSpace(u.Name))
@@ -937,6 +1017,62 @@ public class AuthentikAdminClient : IAuthentikAdminClient
             }
         }
 
+        // ============================================================
+        // ВАЖНО ПРО FullName:
+        //   Есть три источника ФИО в порядке приоритета:
+        //
+        //   1. Отдельные поля attributes.family_name/given_name/
+        //      middle_name — их заполняет enrollment-flow
+        //      (см. uchaly-app.yaml). Именно они есть у всех
+        //      пользователей, зарегистрированных через SPA.
+        //
+        //   2. Единое поле user.name — его заполняет blueprint
+        //      для seed-пользователей (admin, manager и т. д.)
+        //      и админ при ручном создании через Admin API.
+        //
+        //   3. Username — fallback, если ни ФИО, ни name нет.
+        //
+        //   РАНЬШЕ БЫЛА ОШИБКА:
+        //     FullName = string.IsNullOrWhiteSpace(u.Name)
+        //         ? u.Username
+        //         : u.Name
+        //
+        //   Для enrollment-пользователей u.Name пустой, поэтому
+        //   в UI показывался username ("Marat1905") вместо
+        //   "Гафаров Марат Фатихович".
+        //
+        //   ТЕПЕРЬ:
+        //     Сначала пробуем собрать ФИО из отдельных атрибутов
+        //     в русском порядке "Фамилия Имя Отчество". Если
+        //     атрибутов нет — падаем на u.Name, а затем на
+        //     username.
+        // ============================================================
+        var fioParts = new[] { family, given, middle }
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToArray();
+
+        string fullName;
+        if (fioParts.Length > 0)
+        {
+            // Русский порядок: Фамилия Имя Отчество.
+            // string.Join пропустит уже отфильтрованные пустые
+            // значения, поэтому "Гафаров Марат" или
+            // "Гафаров Марат Фатихович" — как заполнено.
+            fullName = string.Join(" ", fioParts);
+        }
+        else if (!string.IsNullOrWhiteSpace(u.Name))
+        {
+            // ФИО отдельными атрибутами не заполнено, но есть
+            // единое user.name (например, из blueprint).
+            fullName = u.Name;
+        }
+        else
+        {
+            // Совсем ничего — показываем username, чтобы UI
+            // не остался с пустым полем.
+            fullName = u.Username;
+        }
+
         return new AdminUserDto
         {
             // ============================================================
@@ -962,7 +1098,7 @@ public class AuthentikAdminClient : IAuthentikAdminClient
             FirstName = given ?? string.Empty,
             LastName = family ?? string.Empty,
             Patronymic = middle ?? string.Empty,
-            FullName = string.IsNullOrWhiteSpace(u.Name) ? u.Username : u.Name,
+            FullName = fullName,
             AvatarUrl = string.IsNullOrWhiteSpace(u.Avatar) ? null : u.Avatar,
             IsActive = u.IsActive,
             IsSuperuser = u.IsSuperuser,
@@ -990,6 +1126,11 @@ public class AuthentikAdminClient : IAuthentikAdminClient
     ///   на null, и обращение к g.UsersObj.Count / g.Users.Count
     ///   падает с NullReferenceException. Поэтому защищаемся
     ///   через ?? new().
+    ///
+    /// ВАЖНО ПРО Description:
+    ///   У группы Authentik нет отдельного поля description.
+    ///   Мы храним его в attributes.description. Извлекаем
+    ///   через GetAttrString.
     /// </summary>
     private static AdminGroupDto MapGroup(AuthentikGroup g)
     {

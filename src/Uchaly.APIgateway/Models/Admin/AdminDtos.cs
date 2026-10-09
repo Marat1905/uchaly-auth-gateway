@@ -54,6 +54,13 @@
 //
 //   У групп, в отличие от пользователей, pk — это строка UUID,
 //   поэтому /api/v3/core/groups/{uuid}/ работает корректно.
+//
+// ВАЖНО ПРО DESCRIPTION У ГРУППЫ:
+//   У группы Authentik НЕТ отдельного поля description —
+//   в отличие от Keycloak, где это стандартное поле.
+//   Описание группы мы храним в attributes.description
+//   (JSONB-поле). Этот атрибут читается в MapGroup при
+//   чтении и записывается в UpdateGroupAsync при обновлении.
 // =============================================================================
 
 using System.Text.Json.Serialization;
@@ -293,16 +300,26 @@ public class SetUserEnabledRequest
 public class CreateGroupRequest
 {
     public string Name { get; set; } = string.Empty;
+    public string? Description { get; set; }
     public bool? IsSuperuser { get; set; }
     public string? Parent { get; set; }
 }
 
 /// <summary>
 /// Тело запроса на обновление группы.
+///
+/// ВАЖНО ПРО Description:
+///   У группы Authentik нет отдельного поля description —
+///   в отличие от Keycloak. Мы храним описание в
+///   attributes.description (JSONB). Поле Description здесь
+///   для удобства фронта: он присылает обычную строку,
+///   а AuthentikAdminClient сам упаковывает её в attributes
+///   перед отправкой в Authentik.
 /// </summary>
 public class UpdateGroupRequest
 {
     public string? Name { get; set; }
+    public string? Description { get; set; }
     public bool? IsSuperuser { get; set; }
     public string? Parent { get; set; }
 }
@@ -477,6 +494,11 @@ internal class AuthentikUserGroupRef
 ///   У групп pk — это строка UUID. Именно она используется
 ///   в URL Admin API /api/v3/core/groups/{pk}/. Это отличается
 ///   от пользователей, у которых pk — число.
+///
+/// ВАЖНО ПРО attributes:
+///   В attributes.description мы храним описание группы,
+///   потому что отдельного поля description у группы
+///   Authentik нет (в отличие от Keycloak).
 /// </summary>
 internal class AuthentikGroup
 {
@@ -509,6 +531,10 @@ internal class AuthentikGroup
     [JsonPropertyName("users_obj")]
     public List<AuthentikGroupUserRef>? UsersObj { get; set; }
 
+    /// <summary>
+    /// Атрибуты группы (JSONB). В нашем случае здесь лежит
+    /// description: attributes["description"] = "...".
+    /// </summary>
     [JsonPropertyName("attributes")]
     public Dictionary<string, object>? Attributes { get; set; }
 }
@@ -593,11 +619,18 @@ internal class AuthentikSetPasswordRequest
 
 /// <summary>
 /// Тело запроса на создание группы.
+///
+/// ВАЖНО: Authentik не имеет поля description у группы,
+/// поэтому описание, если оно передано, кладём в attributes
+/// (см. AuthentikAdminClient.CreateGroupAsync).
 /// </summary>
 internal class AuthentikCreateGroupRequest
 {
     [JsonPropertyName("name")]
     public string Name { get; set; } = string.Empty;
+
+    [JsonPropertyName("attributes")]
+    public Dictionary<string, object>? Attributes { get; set; }
 
     [JsonPropertyName("is_superuser")]
     public bool? IsSuperuser { get; set; }
@@ -608,11 +641,25 @@ internal class AuthentikCreateGroupRequest
 
 /// <summary>
 /// Тело PATCH-запроса на обновление группы.
+///
+/// ВАЖНО ПРО attributes:
+///   Authentik при PATCH с attributes ЗАМЕНЯЕТ весь
+///   JSONB-объект, а не мержит отдельные ключи. Если у группы
+///   были другие атрибуты, при передаче только description
+///   они потеряются. Для нашего случая (только description)
+///   это не критично, но стоит помнить.
 /// </summary>
 internal class AuthentikPatchGroupRequest
 {
     [JsonPropertyName("name")]
     public string? Name { get; set; }
+
+    /// <summary>
+    /// Атрибуты группы (JSONB). В нашем случае здесь лежит
+    /// description: attributes["description"] = "...".
+    /// </summary>
+    [JsonPropertyName("attributes")]
+    public Dictionary<string, object>? Attributes { get; set; }
 
     [JsonPropertyName("is_superuser")]
     public bool? IsSuperuser { get; set; }

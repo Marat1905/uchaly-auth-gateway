@@ -1,6 +1,21 @@
 // src/components/Admin/RoleManagement.tsx
 // =============================================================================
-// Управление ролями через Keycloak Admin REST API.
+// Управление ролями (группами Authentik) через API Gateway.
+//
+// ОСОБЕННОСТИ AUTHENTIK:
+//
+//   1. В отличие от Keycloak, имя роли можно менять — это
+//      обычное поле группы. Поэтому поле "Название роли" в
+//      модалке редактирования РАЗБЛОКИРОВАНО.
+//
+//   2. У группы Authentik нет отдельного поля description.
+//      Backend хранит описание в attributes.description
+//      (JSONB). Фронт об этом не думает — он отправляет
+//      обычную строку, а backend упаковывает её сам.
+//
+//   3. Удаление группы с пользователями Authentik запрещает
+//      (вернёт 400). UI дизейблит кнопку "Удалить", если
+//      userCount > 0.
 // =============================================================================
 
 import React, { useState, useEffect } from 'react';
@@ -20,9 +35,12 @@ const RoleManagement: React.FC = () => {
         setLoading(true);
         try {
             const result = await adminService.getRoles();
-            setRoles(result);
+            // Защита: если backend вернул не массив — принудительно
+            // превращаем в массив, чтобы UI не падал на roles.map.
+            setRoles(Array.isArray(result) ? result : []);
         } catch (error) {
             console.error('Error loading roles:', error);
+            setRoles([]);
         } finally {
             setLoading(false);
         }
@@ -69,7 +87,7 @@ const RoleManagement: React.FC = () => {
                         Управление ролями
                     </h3>
                     <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                        Создание и редактирование ролей системы (Keycloak)
+                        Создание и редактирование ролей системы (Authentik)
                     </p>
                 </div>
                 <button
@@ -164,7 +182,13 @@ const RoleManagement: React.FC = () => {
     );
 };
 
+// =============================================================================
 // Edit Role Modal Component
+//
+// ВАЖНО: в отличие от Keycloak, в Authentik имя роли можно
+// менять. Поэтому поле "Название роли" здесь РАЗБЛОКИРОВАНО —
+// пользователь может изменить и название, и описание.
+// =============================================================================
 const EditRoleModal: React.FC<{ role: RoleDto; onUpdate: (id: string, data: UpdateRoleRequest) => void }> = ({
     role,
     onUpdate
@@ -179,8 +203,15 @@ const EditRoleModal: React.FC<{ role: RoleDto; onUpdate: (id: string, data: Upda
     const handleSave = async () => {
         setLoading(true);
         try {
-            // В Keycloak нельзя переименовать роль — обновляем только описание
-            await onUpdate(role.id, { description: formData.description });
+            // Отправляем и name, и description.
+            //
+            // В Keycloak имя роли менять было нельзя, но в Authentik
+            // можно — это обычное поле группы. Поэтому передаём оба
+            // поля: пользователь может изменить и название, и описание.
+            await onUpdate(role.id, {
+                name: formData.name,
+                description: formData.description,
+            });
             setIsOpen(false);
         } catch (error) {
             // Обработка ошибок — в родителе
@@ -223,12 +254,10 @@ const EditRoleModal: React.FC<{ role: RoleDto; onUpdate: (id: string, data: Upda
                                         type="text"
                                         value={formData.name}
                                         onChange={(e) => setFormData(prev => ({ ...prev, name: e.target.value }))}
-                                        disabled
-                                        title="Keycloak не позволяет переименовать роль"
-                                        className="w-full px-4 py-3 border-2 border-gray-200 dark:border-gray-600 rounded-2xl bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 cursor-not-allowed transition-all duration-200"
+                                        className="w-full px-4 py-3 border-2 border-gray-200 dark:border-gray-600 rounded-2xl focus:outline-none focus:ring-4 focus:ring-blue-500/20 focus:border-blue-500 dark:bg-gray-700 dark:text-white transition-all duration-200"
                                     />
                                     <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                                        В Keycloak имя роли изменить нельзя.
+                                        Имя роли можно изменить. Оно должно быть уникальным.
                                     </p>
                                 </div>
                                 <div>
@@ -268,7 +297,13 @@ const EditRoleModal: React.FC<{ role: RoleDto; onUpdate: (id: string, data: Upda
     );
 };
 
+// =============================================================================
 // Create Role Modal Component
+//
+// Здесь поле "Название роли" всегда редактируемое — при создании
+// это очевидно. Описание тоже можно задать сразу — backend упакует
+// его в attributes.description.
+// =============================================================================
 const CreateRoleModal: React.FC<{ onClose: () => void; onCreate: (data: CreateRoleRequest) => void }> = ({
     onClose,
     onCreate
