@@ -22,6 +22,7 @@ const AdminPanel: React.FC = () => {
     }, []);
 
     const loadStats = async () => {
+        console.log('[AdminPanel] loadStats start');
         try {
             // Было: authService.getAdminStats()
             // Стало: adminService.getStats()

@@ -76,6 +76,37 @@ builder.Services.AddReverseProxy()
 builder.Services.AddAuthentikAuthentication(builder.Configuration);
 
 // ============================================================
+// 5.1. Админ-панель: клиент Authentik Admin API
+// ============================================================
+//
+// Регистрируем:
+//   1. Именованный HttpClient ("AuthentikAdmin") — используется
+//      внутри AuthentikAdminClient через IHttpClientFactory.
+//      Живёт в пуле, безопасно переиспользуется.
+//   2. Scoped-сервис IAuthentikAdminClient — обёртка над
+//      Admin API Authentik.
+//
+// ВАЖНО: клиент читает опции из секции "AuthentikAdmin"
+// (см. appsettings.json / docker-compose.yml).
+builder.Services
+    .AddOptions<Uchaly.APIgateway.Options.AuthentikAdminOptions>()
+    .Bind(builder.Configuration.GetSection(
+        Uchaly.APIgateway.Options.AuthentikAdminOptions.SectionName))
+    .Validate(o => !string.IsNullOrWhiteSpace(o.BaseUrl),
+        "AuthentikAdmin:BaseUrl не задан.")
+    .Validate(o => !string.IsNullOrWhiteSpace(o.ApiToken),
+        "AuthentikAdmin:ApiToken не задан. " +
+        "Укажите ENV AUTHENTIK_ADMIN_TOKEN.")
+    .ValidateOnStart();
+
+builder.Services.AddHttpClient(
+    Uchaly.APIgateway.Services.AuthentikAdminClient.HttpClientName);
+
+builder.Services.AddScoped<
+    Uchaly.APIgateway.Services.IAuthentikAdminClient,
+    Uchaly.APIgateway.Services.AuthentikAdminClient>();
+
+// ============================================================
 // 6. Авторизация
 // ============================================================
 builder.Services.AddAuthorization();

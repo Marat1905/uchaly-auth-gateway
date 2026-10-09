@@ -1,3 +1,26 @@
+# docker-compose.yml
+# =============================================================================
+# Uchaly — корпоративная платформа.
+#
+# В этом файле описаны:
+#   - Authentik (IdP): db + redis + server + worker
+#   - API Gateway (YARP + JWT-валидация Authentik-токенов)
+#   - pgAdmin (управление PostgreSQL)
+#
+# АДМИН-ПАНЕЛЬ:
+#   Для работы админ-панели Gateway вызывает Authentik Admin API
+#   (/api/v3/core/...). Для этого ему нужен серверный API-токен
+#   сервисного пользователя Authentik (AUTHENTIK_ADMIN_TOKEN).
+#   Токен НЕ попадает на фронтенд — вся работа с Admin API идёт
+#   через Gateway, который защищён policy "AdminOnly".
+#
+#   Как получить токен:
+#     Authentik UI → Directory → Tokens and App passwords → Create
+#     Intent = API
+#     User = akadmin (или сервисный пользователь с правами на Admin API)
+#     Скопировать значение в .env как AUTHENTIK_ADMIN_TOKEN.
+# =============================================================================
+
 networks:
   uchaly_network:
     driver: bridge
@@ -152,10 +175,40 @@ services:
       authentik-redis:
         condition: service_healthy
 
-
   # ============================================================
   # API GATEWAY
   # ============================================================
+  #
+  # Gateway выполняет три роли:
+  #
+  #   1. YARP-прокси: маршрутизирует запросы к микросервисам
+  #      (/monitoring, /motor, /humidity, /safety, /auth/authentik).
+  #
+  #   2. Валидатор JWT: проверяет токены, выпущенные Authentik,
+  #      через OIDC discovery
+  #      (http://authentik-server:9000/application/o/uchaly/.well-known/openid-configuration).
+  #      Валидный токен означает, что пользователь аутентифицирован
+  #      в Authentik; для авторизации используются группы (роли)
+  #      из claim'а groups.
+  #
+  #   3. Прокси для админ-панели: контроллер AdminController
+  #      под /api/admin/* вызывает Authentik Admin API от имени
+  #      сервисного пользователя. Это нужно, потому что
+  #      Authentik Admin API требует API-токен, а не OIDC-токен
+  #      пользователя, и его нельзя отдавать в браузер.
+  #
+  # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:
+  #
+  #   Authentik__* — параметры OIDC-валидации. Используются
+  #   JwtBearer middleware.
+  #
+  #   AuthentikAdmin__* — параметры Admin API. Используются
+  #   AuthentikAdminClient (см. src/Uchaly.APIgateway/Services).
+  #   BaseUrl — внутренний URL Authentik в docker-сети.
+  #   ApiToken — Bearer-токен сервисного пользователя для
+  #              /api/v3/core/... Токен передаётся через
+  #              переменную окружения AUTHENTIK_ADMIN_TOKEN,
+  #              определённую в .env.
   uchaly-apigateway:
     image: ${DOCKER_REGISTRY-}uchaly-apigateway
     build:
@@ -169,6 +222,16 @@ services:
       - uchaly_network
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
+
+      # ------------------------------------------------------------
+      # OIDC (валидация токенов)
+      # ------------------------------------------------------------
+      # Authority и MetadataAddress — внутренние адреса Authentik
+      # в docker-сети. Снаружи (из браузера) используется
+      # http://localhost:9000 — это другой URL, но OIDC discovery
+      # отдаёт iss, соответствующий внутреннему адресу. Поэтому
+      # важно, чтобы ValidIssuer совпадал с тем, что реально
+      # в токене (см. AuthentikAuthenticationExtensions).
       - Authentik__Authority=http://authentik-server:9000
       - Authentik__MetadataAddress=http://authentik-server:9000/application/o/uchaly/.well-known/openid-configuration
       - Authentik__RequireHttpsMetadata=false
@@ -178,10 +241,15 @@ services:
       - Authentik__ValidateIssuerSigningKey=true
       - Authentik__ClientId=uchaly-frontend
       - Authentik__Audience=uchaly-frontend
+      - AuthentikAdmin__BaseUrl=http://authentik-server:9000
+      - AuthentikAdmin__ApiToken=${AUTHENTIK_ADMIN_TOKEN}
+      - AuthentikAdmin__TimeoutSeconds=30
     depends_on:
       - authentik-server
 
- 
+  # ============================================================
+  # PGADMIN (веб-интерфейс управления PostgreSQL)
+  # ============================================================
   uchaly-db-admin:
     image: dpage/pgadmin4:latest
     container_name: uchaly-db-admin

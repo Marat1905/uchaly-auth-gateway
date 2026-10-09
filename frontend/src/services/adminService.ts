@@ -1,146 +1,144 @@
-/**
- * adminService.ts
- *
- * Сервис администрирования пользователей и групп через API Gateway.
- *
- * ВАЖНО: этот сервис НЕ обращается к Authentik Admin API напрямую.
- * Все запросы идут через Gateway, который:
- *   1. Проверяет, что у текущего пользователя есть роль "Admin".
- *   2. Использует серверный токен для вызова Authentik Admin API.
- *   3. Возвращает результат фронтенду в нормализованном виде.
- *
- * Эндпоинты Gateway:
- *   GET    /api/admin/stats
- *   GET    /api/admin/users?search=&group=&isActive=&page=&pageSize=
- *   GET    /api/admin/users/{id}
- *   POST   /api/admin/users
- *   PATCH  /api/admin/users/{id}
- *   DELETE /api/admin/users/{id}
- *   POST   /api/admin/users/{id}/set-password
- *   POST   /api/admin/users/{id}/activate
- *   POST   /api/admin/users/{id}/deactivate
- *   GET    /api/admin/groups
- *   POST   /api/admin/groups
- *   PATCH  /api/admin/groups/{id}
- *   DELETE /api/admin/groups/{id}
- *   PATCH  /api/admin/users/{id}/groups   (привязка пользователя к группам)
- */
+// src/services/adminService.ts
+// =============================================================================
+// Сервис администрирования пользователей и групп через API Gateway.
+//
+// ВАЖНО: этот сервис НЕ обращается к Authentik Admin API напрямую.
+// Все запросы идут через Gateway (по /api/admin/*), который:
+//   1. Проверяет, что у текущего пользователя есть роль "Admin"
+//      (policy AdminOnly на контроллере).
+//   2. Использует серверный Bearer-токен для вызовов
+//      Authentik Admin API (/api/v3/core/...).
+//   3. Преобразует ответы Authentik в публичные DTO, которые
+//      совпадают с типами types/auth.ts.
+//
+// Эндпоинты Gateway (реализованы в AdminController.cs):
+//
+//   GET    /api/admin/stats
+//   GET    /api/admin/users?search=&group=&isActive=&page=&pageSize=
+//   GET    /api/admin/users/{id}
+//   POST   /api/admin/users
+//   PATCH  /api/admin/users/{id}
+//   DELETE /api/admin/users/{id}
+//   POST   /api/admin/users/{id}/set-password
+//   POST   /api/admin/users/{id}/reset-password
+//   PATCH  /api/admin/users/{id}/enabled
+//   PATCH  /api/admin/users/{id}/roles
+//   GET    /api/admin/roles
+//   GET    /api/admin/groups
+//   POST   /api/admin/groups
+//   PATCH  /api/admin/groups/{id}
+//   DELETE /api/admin/groups/{id}
+//
+// СЕРВИС ПРЕДОСТАВЛЯЕТ МЕТОДЫ, КОТОРЫЕ ВЫЗЫВАЮТСЯ ИЗ:
+//   - AdminPanel.tsx           — getStats()
+//   - UserManagement.tsx       — getUsers, getRoles, setUserEnabled,
+//                                setUserRolesByName, deleteUser,
+//                                resetUserPassword
+//   - RoleManagement.tsx       — getRoles, createRole, updateRole, deleteRole
+//
+// АХИТЕКТУРНЫЙ КОММЕНТАРИЙ:
+//   Роли в этом приложении == группы Authentik.
+//   В UI мы называем их "роли", потому что семантически они
+//   играют роль RBAC-ролей. Но на уровне API и Gateway это
+//   всегда /api/admin/groups или /api/admin/users/{id}/roles.
+// =============================================================================
 
-import axios from 'axios';
+import axios from "axios";
+import type {
+    UserDto,
+    RoleDto,
+    PagedResultDto,
+    AdminStats,
+    UserManagementFilters,
+    CreateRoleRequest,
+    UpdateRoleRequest,
+} from "../types/auth";
 import {
     requestInterceptor,
     requestErrorInterceptor,
     responseInterceptor,
     responseErrorInterceptor,
-} from './axiosInterceptors';
+} from "./axiosInterceptors";
 
 // ============================================================
-// Типы данных
+// ТИПЫ PAYLOAD (приватные, не экспортируются)
 // ============================================================
 
-/** Пользователь (совместим со старым UserDto). */
-export interface AdminUserDto {
-    id: string;              // UUID (pk в Authentik)
-    username: string;        // username в Authentik
-    email: string;
-    firstName: string;       // given_name
-    lastName: string;        // family_name
-    patronymic?: string;     // middle_name (если настроено)
-    name: string;            // полное имя
-    avatarUrl?: string;      // picture
-    isActive: boolean;       // is_active
-    isSuperuser: boolean;    // is_superuser
-    isDeleted: boolean;      // вычисляется (в Authentik нет soft-delete)
-    roles: string[];         // группы пользователя
-    createdAt: string;       // date_joined
-    lastLogin?: string;      // last_login
-}
-
-/** Группа (аналог роли). */
-export interface AdminGroupDto {
-    id: string;
-    name: string;
-    isSuperuser: boolean;
-    parent?: string | null;
-    userCount: number;
-    createdAt: string;
-}
-
-/** Статистика для админ-панели. */
-export interface AdminStats {
-    totalUsers: number;
-    activeUsers: number;
-    newUsersThisWeek: number;
-    totalGroups: number;
-    totalApplications: number;
-}
-
-/** Фильтры для поиска пользователей. */
-export interface AdminUserFilters {
-    search: string;
-    group: string;
-    isActive: boolean | null;
-    page: number;
-    pageSize: number;
-}
-
-/** Пагинированный ответ. */
-export interface PagedResult<T> {
-    items: T[];
-    totalCount: number;
-    pageNumber: number;
-    pageSize: number;
-    totalPages: number;
-}
-
-/** Запрос на создание пользователя. */
-export interface CreateUserPayload {
+/**
+ * Payload для создания пользователя.
+ * Отправляется в POST /api/admin/users.
+ *
+ * Соответствует C# CreateUserRequest из AdminDtos.cs.
+ */
+interface CreateUserPayload {
     username: string;
     email: string;
     name: string;
     password: string;
     isActive?: boolean;
-    groups?: string[];       // имена групп
+    /** Имена групп, в которые сразу добавить пользователя. */
+    groups?: string[];
 }
 
-/** Запрос на обновление пользователя. */
-export interface UpdateUserPayload {
+/**
+ * Payload для обновления пользователя.
+ * Отправляется в PATCH /api/admin/users/{id}.
+ *
+ * Соответствует C# UpdateUserRequest.
+ */
+interface UpdateUserPayload {
     email?: string;
     name?: string;
     isActive?: boolean;
 }
 
-/** Запрос на создание/обновление группы. */
-export interface CreateGroupPayload {
+/**
+ * Payload для создания группы (роли).
+ * Отправляется в POST /api/admin/groups.
+ */
+interface CreateGroupPayload {
     name: string;
     isSuperuser?: boolean;
     parent?: string | null;
 }
 
-export interface UpdateGroupPayload {
+/**
+ * Payload для обновления группы.
+ */
+interface UpdateGroupPayload {
     name?: string;
     isSuperuser?: boolean;
     parent?: string | null;
 }
 
 // ============================================================
-// Axios-клиент с интерцепторами
+// AXIOS-КЛИЕНТ С ИНТЕРЦЕПТОРАМИ
 // ============================================================
+//
+// Интерцепторы добавляют Authorization: Bearer <accessToken>
+// и автоматически обновляют токен при 401.
+// См. axiosInterceptors.ts.
 
-const API_BASE_URL = '/api';
+const API_BASE_URL = "/api";
 
 const apiClient = axios.create({
     baseURL: API_BASE_URL,
     headers: {
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
     },
 });
 
-apiClient.interceptors.request.use(requestInterceptor, requestErrorInterceptor);
-apiClient.interceptors.response.use(responseInterceptor, responseErrorInterceptor);
+apiClient.interceptors.request.use(
+    requestInterceptor,
+    requestErrorInterceptor,
+);
+apiClient.interceptors.response.use(
+    responseInterceptor,
+    responseErrorInterceptor,
+);
 
 // ============================================================
-// Сервис
+// СЕРВИС
 // ============================================================
 
 export const adminService = {
@@ -150,9 +148,14 @@ export const adminService = {
 
     /**
      * Получить агрегированную статистику для дашборда админа.
+     *
+     * Backend возвращает AdminStatsDto:
+     *   { totalUsers, activeUsers, newUsersThisWeek, totalRoles }
+     *
+     * Вызывается из AdminPanel.tsx через loadStats().
      */
     async getStats(): Promise<AdminStats> {
-        const response = await apiClient.get<AdminStats>('/admin/stats');
+        const response = await apiClient.get<AdminStats>("/admin/stats");
         return response.data;
     },
 
@@ -162,47 +165,77 @@ export const adminService = {
 
     /**
      * Поиск пользователей с фильтрами и пагинацией.
+     *
+     * Фильтры (UserManagementFilters):
+     *   - search   — поиск по username/name/email
+     *   - role     — имя группы (== имени роли)
+     *   - isActive — true/false/null
+     *   - isDeleted — не используется в Authentik (всегда null)
+     *   - page, pageSize
+     *
+     * Возвращает PagedResultDto<UserDto>, как ожидает UI.
      */
-    async searchUsers(filters: AdminUserFilters): Promise<PagedResult<AdminUserDto>> {
+    async getUsers(
+        filters: UserManagementFilters,
+    ): Promise<PagedResultDto<UserDto>> {
         const params = new URLSearchParams();
-        params.append('page', filters.page.toString());
-        params.append('pageSize', filters.pageSize.toString());
 
-        if (filters.search) params.append('search', filters.search);
-        if (filters.group) params.append('group', filters.group);
-        if (filters.isActive !== null) {
-            params.append('isActive', filters.isActive.toString());
+        params.append("page", String(filters.page));
+        params.append("pageSize", String(filters.pageSize));
+
+        if (filters.search) {
+            params.append("search", filters.search);
         }
 
-        const response = await apiClient.get<PagedResult<AdminUserDto>>(
-            `/admin/users?${params.toString()}`
+        if (filters.role) {
+            // Поле role в фильтре — это имя группы (роли).
+            params.append("group", filters.role);
+        }
+
+        if (filters.isActive !== null) {
+            params.append("isActive", String(filters.isActive));
+        }
+
+        // isDeleted не передаём — в Authentik нет мягкого удаления.
+
+        const response = await apiClient.get<PagedResultDto<UserDto>>(
+            `/admin/users?${params.toString()}`,
         );
         return response.data;
     },
 
     /**
-     * Получить пользователя по ID.
+     * Получить пользователя по UUID.
      */
-    async getUserById(id: string): Promise<AdminUserDto> {
-        const response = await apiClient.get<AdminUserDto>(`/admin/users/${id}`);
+    async getUserById(id: string): Promise<UserDto> {
+        const response = await apiClient.get<UserDto>(`/admin/users/${id}`);
         return response.data;
     },
 
     /**
      * Создать нового пользователя.
+     *
+     * Требует обязательных полей: username, email, password.
+     * Поле name — необязательно, если пустое — backend использует username.
      */
-    async createUser(payload: CreateUserPayload): Promise<AdminUserDto> {
-        const response = await apiClient.post<AdminUserDto>('/admin/users', payload);
+    async createUser(payload: CreateUserPayload): Promise<UserDto> {
+        const response = await apiClient.post<UserDto>(
+            "/admin/users",
+            payload,
+        );
         return response.data;
     },
 
     /**
-     * Обновить пользователя (email, имя, активность).
+     * Обновить пользователя (email, name, isActive).
      */
-    async updateUser(id: string, payload: UpdateUserPayload): Promise<AdminUserDto> {
-        const response = await apiClient.patch<AdminUserDto>(
+    async updateUser(
+        id: string,
+        payload: UpdateUserPayload,
+    ): Promise<UserDto> {
+        const response = await apiClient.patch<UserDto>(
             `/admin/users/${id}`,
-            payload
+            payload,
         );
         return response.data;
     },
@@ -212,7 +245,7 @@ export const adminService = {
      *
      * ВНИМАНИЕ: в Authentik это физическое удаление, не soft-delete.
      * Восстановить пользователя нельзя (только из бэкапа БД).
-     * Рекомендуется вместо удаления использовать деактивацию.
+     * В UI вместо удаления предпочтительна деактивация.
      */
     async deleteUser(id: string): Promise<void> {
         await apiClient.delete(`/admin/users/${id}`);
@@ -220,109 +253,187 @@ export const adminService = {
 
     /**
      * Установить новый пароль пользователю.
-     * Возвращает сгенерированный пароль, если он не был передан.
+     * Если password не передан — backend сгенерирует случайный
+     * и вернёт его.
      */
-    async setPassword(id: string, password?: string): Promise<{ password: string }> {
+    async setPassword(
+        id: string,
+        password?: string,
+    ): Promise<{ password: string }> {
         const response = await apiClient.post<{ password: string }>(
             `/admin/users/${id}/set-password`,
-            { password }
+            { password },
         );
         return response.data;
     },
 
     /**
-     * Активировать пользователя.
+     * Сбросить пароль пользователя — сгенерировать случайный
+     * и вернуть его. Удобно для UI без формы ввода.
+     *
+     * Возвращает сам новый пароль строкой, потому что так
+     * ожидает UserManagement.handleResetPassword.
      */
-    async activateUser(id: string): Promise<AdminUserDto> {
-        const response = await apiClient.post<AdminUserDto>(
-            `/admin/users/${id}/activate`
+    async resetUserPassword(id: string): Promise<string> {
+        const response = await apiClient.post<{ password: string }>(
+            `/admin/users/${id}/reset-password`,
+        );
+        return response.data.password;
+    },
+
+    /**
+     * Активировать/деактивировать пользователя.
+     *
+     * Вызывается из UserManagement.toggleUserStatus.
+     */
+    async setUserEnabled(id: string, isActive: boolean): Promise<UserDto> {
+        const response = await apiClient.patch<UserDto>(
+            `/admin/users/${id}/enabled`,
+            { isActive },
         );
         return response.data;
     },
 
     /**
-     * Деактивировать пользователя.
+     * Активировать пользователя. Обёртка над setUserEnabled.
      */
-    async deactivateUser(id: string): Promise<AdminUserDto> {
-        const response = await apiClient.post<AdminUserDto>(
-            `/admin/users/${id}/deactivate`
+    async activateUser(id: string): Promise<UserDto> {
+        return this.setUserEnabled(id, true);
+    },
+
+    /**
+     * Деактивировать пользователя. Обёртка над setUserEnabled.
+     */
+    async deactivateUser(id: string): Promise<UserDto> {
+        return this.setUserEnabled(id, false);
+    },
+
+    /**
+     * Установить список групп (ролей) пользователя.
+     * Передаётся ПОЛНЫЙ желаемый список имён — старые группы,
+     * которых нет в новом списке, будут отвязаны.
+     */
+    async setUserGroups(
+        id: string,
+        groupNames: string[],
+    ): Promise<UserDto> {
+        const response = await apiClient.patch<UserDto>(
+            `/admin/users/${id}/roles`,
+            { groups: groupNames },
         );
         return response.data;
     },
 
     /**
-     * Установить список групп пользователя.
-     * Передаётся полный список — старые группы будут отвязаны.
+     * Алиас для setUserGroups — используется в UserManagement.tsx
+     * под именем setUserRolesByName (роли == группы).
      */
-    async setUserGroups(id: string, groupNames: string[]): Promise<AdminUserDto> {
-        const response = await apiClient.patch<AdminUserDto>(
-            `/admin/users/${id}/groups`,
-            { groups: groupNames }
-        );
-        return response.data;
+    async setUserRolesByName(
+        userId: string,
+        roleNames: string[],
+    ): Promise<UserDto> {
+        return this.setUserGroups(userId, roleNames);
     },
 
     /**
-     * Добавить пользователя в группу (без удаления из остальных).
+     * Добавить пользователя в одну группу (без удаления из остальных).
      */
-    async addUserToGroup(userId: string, groupName: string): Promise<AdminUserDto> {
+    async addUserToGroup(
+        userId: string,
+        groupName: string,
+    ): Promise<UserDto> {
         const user = await this.getUserById(userId);
         const groups = Array.from(new Set([...user.roles, groupName]));
         return this.setUserGroups(userId, groups);
     },
 
     /**
-     * Удалить пользователя из группы.
+     * Удалить пользователя из одной группы.
      */
-    async removeUserFromGroup(userId: string, groupName: string): Promise<AdminUserDto> {
+    async removeUserFromGroup(
+        userId: string,
+        groupName: string,
+    ): Promise<UserDto> {
         const user = await this.getUserById(userId);
         const groups = user.roles.filter((g) => g !== groupName);
         return this.setUserGroups(userId, groups);
     },
 
     // ==========================================================
-    // ГРУППЫ (аналог ролей)
+    // ГРУППЫ / РОЛИ
     // ==========================================================
 
     /**
-     * Получить список всех групп с количеством пользователей.
+     * Получить список всех ролей (групп) с количеством пользователей.
+     *
+     * Backend возвращает List<AdminGroupDto>, который в точности
+     * соответствует TypeScript-типу RoleDto.
      */
-    async getAllGroups(): Promise<AdminGroupDto[]> {
-        const response = await apiClient.get<AdminGroupDto[]>('/admin/groups');
+    async getRoles(): Promise<RoleDto[]> {
+        const response = await apiClient.get<RoleDto[]>("/admin/roles");
         return response.data;
     },
 
     /**
-     * Получить группу по ID.
+     * Алиас getRoles — на случай, если где-то зовут getAllGroups.
      */
-    async getGroupById(id: string): Promise<AdminGroupDto> {
-        const response = await apiClient.get<AdminGroupDto>(`/admin/groups/${id}`);
-        return response.data;
+    async getAllGroups(): Promise<RoleDto[]> {
+        return this.getRoles();
     },
 
     /**
-     * Создать новую группу.
+     * Получить роль (группу) по UUID.
      */
-    async createGroup(payload: CreateGroupPayload): Promise<AdminGroupDto> {
-        const response = await apiClient.post<AdminGroupDto>('/admin/groups', payload);
-        return response.data;
-    },
-
-    /**
-     * Обновить группу.
-     */
-    async updateGroup(id: string, payload: UpdateGroupPayload): Promise<AdminGroupDto> {
-        const response = await apiClient.patch<AdminGroupDto>(
+    async getGroupById(id: string): Promise<RoleDto> {
+        const response = await apiClient.get<RoleDto>(
             `/admin/groups/${id}`,
-            payload
         );
         return response.data;
     },
 
     /**
-     * Удалить группу.
+     * Создать новую роль (группу).
      */
-    async deleteGroup(id: string): Promise<void> {
+    async createRole(payload: CreateRoleRequest): Promise<RoleDto> {
+        const body: CreateGroupPayload = {
+            name: payload.name,
+        };
+        const response = await apiClient.post<RoleDto>(
+            "/admin/groups",
+            body,
+        );
+        return response.data;
+    },
+
+    /**
+     * Обновить роль (группу).
+     *
+     * ВНИМАНИЕ: в Authentik имя группы переименовать нельзя —
+     * поэтому UI блокирует поле name. Backend тоже примет name,
+     * но реально применится только к описанию (которое мы храним
+     * в attributes, если оно есть).
+     */
+    async updateRole(
+        id: string,
+        payload: UpdateRoleRequest,
+    ): Promise<RoleDto> {
+        const body: UpdateGroupPayload = {
+            name: payload.name,
+        };
+        const response = await apiClient.patch<RoleDto>(
+            `/admin/groups/${id}`,
+            body,
+        );
+        return response.data;
+    },
+
+    /**
+     * Удалить роль (группу).
+     *
+     * Authentik вернёт ошибку 400, если в группе есть пользователи.
+     * UI должен показать её.
+     */
+    async deleteRole(id: string): Promise<void> {
         await apiClient.delete(`/admin/groups/${id}`);
     },
 
@@ -332,16 +443,13 @@ export const adminService = {
 
     /**
      * Сформировать URL аватара пользователя.
-     * В Authentik используется Gravatar или внешний URL из `picture`.
+     * В Authentik используется Gravatar или внешний URL из `avatar`.
      */
     getAvatarUrl(userId: string, email?: string): string {
         if (email) {
-            // Gravatar по email — надёжнее, чем по UUID
-            // `d=mp` — "mystery person" заглушка, если у пользователя нет Gravatar
             const hash = this.md5(email.trim().toLowerCase());
             return `https://www.gravatar.com/avatar/${hash}?d=mp&s=200`;
         }
-        // Fallback: заглушка-иконка
         return `https://www.gravatar.com/avatar/00000000000000000000000000000000?d=mp&s=200`;
     },
 
@@ -350,8 +458,6 @@ export const adminService = {
      * Реализация без внешних зависимостей.
      */
     md5(input: string): string {
-        // Реализация MD5 — compact version
-        // Источник: адаптировано из публичного домена
         function rotateLeft(value: number, shift: number): number {
             return (value << shift) | (value >>> (32 - shift));
         }
@@ -361,7 +467,12 @@ export const adminService = {
             return (msw << 16) | (lsw & 0xffff);
         }
         function cmn(
-            q: number, a: number, b: number, x: number, s: number, t: number
+            q: number,
+            a: number,
+            b: number,
+            x: number,
+            s: number,
+            t: number,
         ): number {
             a = addUnsigned(addUnsigned(a, q), addUnsigned(x, t));
             return addUnsigned(rotateLeft(a, s), b);
@@ -383,7 +494,8 @@ export const adminService = {
             const lWordCount = utf8.length;
             const lMessageLength = lWordCount;
             const lNumberOfWordsTemp1 = lMessageLength + 8;
-            const lNumberOfWordsTemp2 = (lNumberOfWordsTemp1 - (lNumberOfWordsTemp1 % 64)) / 64;
+            const lNumberOfWordsTemp2 =
+                (lNumberOfWordsTemp1 - (lNumberOfWordsTemp1 % 64)) / 64;
             const lNumberOfWords = (lNumberOfWordsTemp2 + 1) * 16;
             const lWordArray: number[] = new Array(lNumberOfWords - 1).fill(0);
             let lBytePosition = 0;
@@ -391,21 +503,24 @@ export const adminService = {
             while (lByteCount < lMessageLength) {
                 const lWordCount2 = (lByteCount - (lByteCount % 4)) / 4;
                 const lBytePosition2 = (lByteCount % 4) * 8;
-                lWordArray[lWordCount2] = lWordArray[lWordCount2] | (utf8.charCodeAt(lByteCount) << lBytePosition2);
+                lWordArray[lWordCount2] =
+                    lWordArray[lWordCount2] |
+                    (utf8.charCodeAt(lByteCount) << lBytePosition2);
                 lByteCount++;
             }
             const lWordCount3 = (lByteCount - (lByteCount % 4)) / 4;
             const lBytePosition3 = (lByteCount % 4) * 8;
-            lWordArray[lWordCount3] = lWordArray[lWordCount3] | (0x80 << lBytePosition3);
+            lWordArray[lWordCount3] =
+                lWordArray[lWordCount3] | (0x80 << lBytePosition3);
             lWordArray[lNumberOfWords - 2] = lMessageLength << 3;
             lWordArray[lNumberOfWords - 1] = lMessageLength >>> 29;
             return lWordArray;
         }
         function wordToHex(value: number): string {
-            let hex = '';
+            let hex = "";
             for (let i = 0; i <= 3; i++) {
                 const byte = (value >>> (i * 8)) & 255;
-                hex += ('0' + byte.toString(16)).slice(-2);
+                hex += ("0" + byte.toString(16)).slice(-2);
             }
             return hex;
         }
@@ -491,8 +606,9 @@ export const adminService = {
             d = addUnsigned(d, DD);
         }
 
-        const temp = wordToHex(a) + wordToHex(b) + wordToHex(c) + wordToHex(d);
-        return temp.toLowerCase();
+        return (
+            wordToHex(a) + wordToHex(b) + wordToHex(c) + wordToHex(d)
+        ).toLowerCase();
     },
 };
 
