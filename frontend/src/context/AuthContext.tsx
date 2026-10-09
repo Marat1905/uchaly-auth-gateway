@@ -13,12 +13,17 @@ import type { UserDto } from "../types/auth";
 
 /**
  * Контекст аутентификации, работающий с Authentik.
- * Убраны все вызовы кастомного Identity (login/refresh/revoke).
- * Теперь:
- * - login() выполняет редирект на Authentik.
- * - register() выполняет редирект на страницу регистрации Authentik.
- * - logout() выполняет редирект на end-session Authentik.
- * - Профиль пользователя приходит из userinfo Authentik.
+ *
+ * ИЗМЕНЕНИЯ (путь A):
+ *   - Добавлен метод fullLogout() — полный выход с завершением
+ *     сессии Authentik. Раньше был только logout() (локальная
+ *     очистка localStorage без редиректа на end-session).
+ *   - fullLogout используется кнопкой «Выйти» в UserDropdown —
+ *     это гарантирует, что после выхода сессия Authentik убита,
+ *     и следующий вход покажет форму логина/пароля.
+ *   - AuthProvider переключён на дефолтные flow Authentik в
+ *     blueprint — поэтому silent-возврат из user settings flow
+ *     и password change flow работает без повторного логина.
  */
 
 export type TestRole = "User" | "Safety" | "TCX" | "Admin";
@@ -47,17 +52,68 @@ interface AuthContextType {
     /**
      * Запускает редирект на enrollment-флоу Authentik —
      * страницу регистрации нового пользователя.
-     *
-     * В отличие от login(), здесь НЕ используется OAuth2 — это
-     * отдельный HTML-интерфейс Authentik. После успешной регистрации
-     * пользователь попадёт обратно в SPA (на /login?registered=true),
-     * где сможет войти со своими новыми учётными данными.
      */
     register: () => Promise<void>;
 
+    /**
+     * ЛОКАЛЬНЫЙ выход.
+     *
+     * Что делает:
+     *   - Очищает localStorage (токены, профиль).
+     *   - НЕ делает редирект.
+     *   - НЕ убивает сессию Authentik (cookie authentik_session
+     *     остаётся живой).
+     *
+     * Когда использовать:
+     *   - При обработке 401 в responseInterceptor, когда refresh
+     *     не удался — там нельзя редиректить, иначе зациклится.
+     *   - Когда нужно сбросить локальное состояние, но оставить
+     *     пользователя в SPA.
+     *
+     * Для смены пользователя используйте fullLogout().
+     */
     logout: () => void;
+
+    /**
+     * ПОЛНЫЙ выход.
+     *
+     * Что делает:
+     *   1. Очищает localStorage (токены, профиль) — то же,
+     *      что logout().
+     *   2. Редиректит на /application/o/uchaly/end-session/ —
+     *      это убивает cookie authentik_session на сервере.
+     *   3. Authentik после этого редиректит на
+     *      post_logout_redirect_uri (http://localhost:62080/).
+     *
+     * Когда использовать:
+     *   - Кнопка «Выйти» в UserDropdown — именно этот сценарий.
+     *   - Любой другой, когда нужно сменить пользователя.
+     *
+     * ПОСЛЕ ВЫЗОВА:
+     *   Пользователь попадает на /login (или на главную).
+     *   Следующий клик «Войти» гарантированно покажет форму
+     *   логина Authentik, потому что сессии больше нет.
+     */
+    fullLogout: () => void;
+
     refreshUser: () => Promise<void>;
     loading: boolean;
+
+    /**
+     * Открывает нативный user settings flow Authentik —
+     * страницу редактирования профиля (ФИО).
+     *
+     * Внутри — редирект браузера на /if/flow/uchaly-user-settings/
+     * с next=<относительный OAuth2-authorize URL>. После
+     * завершения flow пользователь вернётся в SPA на /profile.
+     */
+    openUserSettingsFlow: () => Promise<void>;
+
+    /**
+     * Открывает нативный password change flow Authentik —
+     * страницу смены пароля.
+     */
+    openPasswordChangeFlow: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -180,19 +236,44 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
 
     /**
      * Запускает редирект на страницу регистрации Authentik.
-     *
-     * Не путать с login(): login() идёт через OAuth2 authorize endpoint
-     * и возвращается на /auth/callback с code/state. register() идёт
-     * напрямую на /if/flow/uchaly-enrollment/ и возвращается на
-     * /login?registered=true (URL задаётся в authService).
      */
     const register = async () => {
         await authService.registerWithAuthentik();
     };
 
+    /**
+     * Локальный выход — очищает стейт и localStorage,
+     * но НЕ убивает сессию Authentik.
+     *
+     * Используется во внутренних сценариях (обработка 401,
+     * где редирект на end-session вызвал бы зацикливание).
+     */
     const logout = () => {
         authService.logout();
         setUser(null);
+    };
+
+    /**
+     * Полный выход — очищает стейт, localStorage И убивает
+     * сессию Authentik через /end-session/.
+     *
+     * После этого пользователь вернётся в SPA (по
+     * post_logout_redirect_uri провайдера). Следующий вход
+     * покажет форму логина.
+     */
+    const fullLogout = () => {
+        // authService.fullLogout:
+        //   1. Вызывает logout() — очищает localStorage.
+        //   2. Формирует URL /application/o/uchaly/end-session/
+        //      с post_logout_redirect_uri = origin.
+        //   3. Редиректит браузер на этот URL.
+        //
+        // ВАЖНО: после вызова этой функции компонент НЕ продолжит
+        // работу — браузер уйдёт на end-session. Поэтому setUser(null)
+        // здесь не обязателен, но мы делаем это для чистоты стейта
+        // на случай, если редирект почему-то не сработает.
+        setUser(null);
+        authService.fullLogout();
     };
 
     const refreshUser = async () => {
@@ -203,6 +284,41 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         } catch (error) {
             console.error("Не удалось обновить профиль:", error);
             throw error;
+        }
+    };
+
+    /**
+     * Открывает нативный user settings flow Authentik
+     * для редактирования ФИО.
+     *
+     * Внутри — асинхронный вызов сервиса (PKCE + authorize-chain),
+     * затем редирект браузера. returnPath = /profile.
+     */
+    const openUserSettingsFlow = async () => {
+        try {
+            const url = await authService.getUserSettingsFlowUrl("/profile");
+            window.location.href = url;
+        } catch (error) {
+            console.error(
+                "[AuthContext] Не удалось открыть user settings flow:",
+                error
+            );
+        }
+    };
+
+    /**
+     * Открывает нативный password change flow Authentik
+     * для смены пароля.
+     */
+    const openPasswordChangeFlow = async () => {
+        try {
+            const url = await authService.getPasswordChangeFlowUrl("/profile");
+            window.location.href = url;
+        } catch (error) {
+            console.error(
+                "[AuthContext] Не удалось открыть password change flow:",
+                error
+            );
         }
     };
 
@@ -227,8 +343,11 @@ export const AuthProvider: React.FC<AuthProviderProps> = ({ children }) => {
         login,
         register,
         logout,
+        fullLogout,
         refreshUser,
         loading,
+        openUserSettingsFlow,
+        openPasswordChangeFlow,
     };
 
     return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

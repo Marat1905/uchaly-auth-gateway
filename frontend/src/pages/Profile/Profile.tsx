@@ -1,26 +1,81 @@
 // src/pages/Profile/Profile.tsx
 // =============================================================================
-// Страница профиля. После перехода на Keycloak редактирование профиля
-// выполняется через Account Console Keycloak. Мы лишь показываем данные
-// текущего пользователя и предоставляем кнопку перехода в Account Console.
+// Страница профиля пользователя.
+//
+// АРХИТЕКТУРНОЕ РЕШЕНИЕ:
+//   Редактирование профиля и смена пароля выполняются НЕ в этом
+//   компоненте, а в нативных flow Authentik. Этот компонент
+//   предоставляет:
+//     - Отображение текущих данных пользователя (ФИО, email, роли).
+//     - Кнопку «Редактировать профиль» → редирект на
+//       /if/flow/uchaly-user-settings/.
+//     - Кнопку «Сменить пароль» → редирект на
+//       /if/flow/uchaly-password-change/.
+//
+//   Такой подход:
+//     - Не требует AdminToken на Gateway (безопаснее).
+//     - Использует штатные механизмы Authentik.
+//     - Исключает передачу пароля через промежуточные сервисы.
+//
+// EMAIL:
+//   Email отображается как read-only и дополнительно защищён
+//   атрибутом goauthentik.io/user/can-change-email: false,
+//   который выставлен всем пользователям в blueprint.
+//   Это значит, что даже если пользователь откроет
+//   /if/user/ напрямую — поле email будет недоступно
+//   для редактирования.
+//
+// ОБНОВЛЕНИЕ ДАННЫХ ПОСЛЕ ВОЗВРАТА ИЗ FLOW:
+//   После завершения user settings flow Authentik редиректит
+//   пользователя обратно в SPA. Компонент Profile при монтировании
+//   вызывает refreshUser() — это подтягивает свежие ФИО из userinfo.
+//   Дополнительно есть ручная кнопка «Обновить данные».
 // =============================================================================
 
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
+import toast from 'react-hot-toast';
 import { useAuth } from '../../context/AuthContext';
 import PageMeta from '../../components/common/PageMeta';
 import PageBreadcrumb from '../../components/common/PageBreadCrumb';
 
 const Profile: React.FC = () => {
-    const { user, openAccountConsole, refreshUser } = useAuth();
+    // user — источник данных для отображения.
+    // refreshUser — метод для подтягивания свежего профиля из userinfo.
+    // openUserSettingsFlow / openPasswordChangeFlow — редиректы на flow Authentik.
+    const {
+        user,
+        refreshUser,
+        openUserSettingsFlow,
+        openPasswordChangeFlow,
+    } = useAuth();
 
-    const handleRefresh = async () => {
-        try {
-            await refreshUser();
-        } catch (error) {
-            console.error('[Profile] Не удалось обновить данные:', error);
-        }
-    };
+    /**
+     * Ref-флаг, чтобы refreshUser() при монтировании
+     * сработал ровно один раз — даже в React StrictMode,
+     * где useEffect вызывается дважды в dev-режиме.
+     */
+    const hasRefreshedOnMount = useRef(false);
 
+    // ---------------------------------------------------------------------
+    // При монтировании компонента подтягиваем свежий профиль.
+    // Это особенно важно после возврата из user settings flow —
+    // пользователь изменил ФИО, и мы хотим сразу показать новые значения.
+    // ---------------------------------------------------------------------
+    useEffect(() => {
+        if (hasRefreshedOnMount.current) return;
+        hasRefreshedOnMount.current = true;
+
+        // Тихое обновление — без toast, чтобы не раздражать пользователя
+        // при каждом входе на страницу.
+        refreshUser().catch((error) => {
+            console.warn('[Profile] Не удалось обновить профиль при монтировании:', error);
+        });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Если пользователя ещё нет — показываем спиннер.
+    // (Теоретически страница защищена ProtectedRoute, но после
+    // logout в фоне user может стать null до навигации.)
     if (!user) {
         return (
             <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex items-center justify-center">
@@ -29,6 +84,69 @@ const Profile: React.FC = () => {
         );
     }
 
+    // =====================================================================
+    // ОБРАБОТЧИКИ
+    // =====================================================================
+
+    /**
+     * Ручное обновление данных из Authentik (userinfo).
+     * Полезно, если профиль был изменён в другом месте,
+     * или просто для проверки, что токен ещё валиден.
+     */
+    const handleRefreshUser = async () => {
+        const toastId = toast.loading('Обновление данных...');
+        try {
+            await refreshUser();
+            toast.success('Данные обновлены', { id: toastId });
+        } catch (error) {
+            console.error('[Profile] Не удалось обновить данные:', error);
+            toast.error('Не удалось обновить данные', { id: toastId });
+        }
+    };
+
+    /**
+     * Переход на нативный user settings flow Authentik.
+     *
+     * Что произойдёт:
+     *   1. Браузер перейдёт на /if/flow/uchaly-user-settings/.
+     *   2. Пользователь увидит форму Authentik с полями
+     *      Фамилия / Имя / Отчество (предзаполненными).
+     *   3. Изменит значения, нажмёт «Сохранить».
+     *   4. Authentik запишет новые значения в user.attributes
+     *      и редиректит обратно в SPA.
+     *   5. Компонент Profile при монтировании подтянет
+     *      обновлённые ФИО через refreshUser().
+     *
+     * ВАЖНО: email в этой форме отсутствует — его нельзя
+     * изменить ни через этот flow, ни через /if/user/
+     * (запрещено атрибутом goauthentik.io/user/can-change-email).
+     */
+    const handleOpenUserSettings = () => {
+        openUserSettingsFlow();
+    };
+
+    /**
+     * Переход на нативный password change flow Authentik.
+     *
+     * Что произойдёт:
+     *   1. Браузер перейдёт на /if/flow/uchaly-password-change/.
+     *   2. Пользователь введёт текущий пароль — Password Stage
+     *      проверит его. Если пароль неверный — flow прервётся.
+     *   3. Если пароль верный — появится форма нового пароля
+     *      (два поля: новый пароль и подтверждение).
+     *   4. User Write Stage запишет новый пароль.
+     *   5. Пользователь вернётся в SPA.
+     *
+     * ВАЖНО: текущий access-токен остаётся валидным до
+     * истечения exp. Пользователю не нужно логиниться заново.
+     */
+    const handleOpenPasswordChange = () => {
+        openPasswordChangeFlow();
+    };
+
+    // =====================================================================
+    // РЕНДЕР
+    // =====================================================================
     return (
         <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
             <div className="container mx-auto px-4 py-8">
@@ -40,7 +158,9 @@ const Profile: React.FC = () => {
                 <PageBreadcrumb pageTitle="Профиль" />
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    {/* Карточка пользователя */}
+                    {/* =====================================================
+                        Левая колонка: карточка пользователя
+                        ===================================================== */}
                     <div className="lg:col-span-1">
                         <div className="bg-white dark:bg-gray-800 rounded-3xl shadow-xl p-6">
                             <div className="flex flex-col items-center">
@@ -69,13 +189,19 @@ const Profile: React.FC = () => {
 
                             <div className="mt-6 space-y-3">
                                 <button
-                                    onClick={openAccountConsole}
+                                    onClick={handleOpenUserSettings}
                                     className="w-full px-4 py-3 bg-gradient-to-r from-blue-600 to-purple-600 text-white font-bold rounded-2xl hover:from-blue-700 hover:to-purple-700 transition-all duration-200 shadow-lg"
                                 >
-                                    Редактировать в Keycloak
+                                    Редактировать профиль
                                 </button>
                                 <button
-                                    onClick={handleRefresh}
+                                    onClick={handleOpenPasswordChange}
+                                    className="w-full px-4 py-3 bg-gradient-to-r from-purple-600 to-pink-600 text-white font-bold rounded-2xl hover:from-purple-700 hover:to-pink-700 transition-all duration-200 shadow-lg"
+                                >
+                                    Сменить пароль
+                                </button>
+                                <button
+                                    onClick={handleRefreshUser}
                                     className="w-full px-4 py-3 bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-200 font-semibold rounded-2xl hover:bg-gray-300 dark:hover:bg-gray-600 transition-all duration-200"
                                 >
                                     Обновить данные
@@ -84,7 +210,9 @@ const Profile: React.FC = () => {
                         </div>
                     </div>
 
-                    {/* Детали */}
+                    {/* =====================================================
+                        Правая колонка: детали профиля
+                        ===================================================== */}
                     <div className="lg:col-span-2">
                         <div className="bg-white dark:bg-gray-800 rounded-3xl shadow-xl p-8">
                             <h3 className="text-2xl font-bold text-gray-900 dark:text-white mb-6">
@@ -97,7 +225,7 @@ const Profile: React.FC = () => {
                                         Имя
                                     </dt>
                                     <dd className="mt-1 text-lg text-gray-900 dark:text-white">
-                                        {user.firstName}
+                                        {user.firstName || '—'}
                                     </dd>
                                 </div>
                                 <div>
@@ -105,7 +233,7 @@ const Profile: React.FC = () => {
                                         Фамилия
                                     </dt>
                                     <dd className="mt-1 text-lg text-gray-900 dark:text-white">
-                                        {user.lastName}
+                                        {user.lastName || '—'}
                                     </dd>
                                 </div>
                                 <div>
@@ -116,14 +244,47 @@ const Profile: React.FC = () => {
                                         {user.patronymic || '—'}
                                     </dd>
                                 </div>
+
+                                {/*
+                                 * Email — всегда read-only.
+                                 *
+                                 * Дополнительная защита: в blueprint
+                                 * всем пользователям выставлен атрибут
+                                 * goauthentik.io/user/can-change-email: false.
+                                 * Это значит, что даже если пользователь
+                                 * откроет /if/user/ напрямую — поле email
+                                 * будет недоступно для редактирования.
+                                 */}
                                 <div>
                                     <dt className="text-sm font-medium text-gray-500 dark:text-gray-400">
-                                        Email
+                                        Email (нельзя изменить)
                                     </dt>
-                                    <dd className="mt-1 text-lg text-gray-900 dark:text-white">
-                                        {user.email}
+                                    <dd className="mt-1">
+                                        <div className="relative">
+                                            <input
+                                                type="email"
+                                                value={user.email}
+                                                readOnly
+                                                disabled
+                                                className="w-full px-4 py-3 rounded-2xl border-2 border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 cursor-not-allowed"
+                                            />
+                                            <svg
+                                                className="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400"
+                                                fill="none"
+                                                stroke="currentColor"
+                                                viewBox="0 0 24 24"
+                                            >
+                                                <path
+                                                    strokeLinecap="round"
+                                                    strokeLinejoin="round"
+                                                    strokeWidth={2}
+                                                    d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"
+                                                />
+                                            </svg>
+                                        </div>
                                     </dd>
                                 </div>
+
                                 <div>
                                     <dt className="text-sm font-medium text-gray-500 dark:text-gray-400">
                                         Идентификатор (sub)
@@ -147,16 +308,18 @@ const Profile: React.FC = () => {
                                 </div>
                             </dl>
 
+                            {/*
+                             * Информационный блок: объясняем пользователю,
+                             * что редактирование профиля и смена пароля
+                             * происходят в интерфейсе Authentik.
+                             */}
                             <div className="mt-8 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-2xl">
                                 <p className="text-sm text-blue-800 dark:text-blue-200">
-                                    Для изменения личных данных и смены пароля перейдите в{' '}
-                                    <button
-                                        onClick={openAccountConsole}
-                                        className="font-bold underline hover:no-underline"
-                                    >
-                                        Account Console Keycloak
-                                    </button>
-                                    .
+                                    Редактирование профиля и смена пароля выполняются
+                                    в защищённом интерфейсе системы аутентификации
+                                    Authentik. Нажмите соответствующую кнопку — браузер
+                                    откроет форму Authentik, где вы сможете внести
+                                    изменения. Email изменить нельзя.
                                 </p>
                             </div>
                         </div>

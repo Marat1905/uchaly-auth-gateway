@@ -8,8 +8,14 @@ import { useAuth } from "../../context/AuthContext";
  * Компонент обработки callback от Authentik.
  * URL: /auth/callback?code=...&state=...
  *
- * После успешного обмена code → tokens сохраняет их
- * и редиректит пользователя на главную.
+ * Сценарии, в которых пользователь сюда попадает:
+ *   1. Обычный логин через OAuth2. Тогда после обработки
+ *      редирект на "/" (или на сохранённый post_flow_redirect,
+ *      если он есть — см. п. 2).
+ *   2. Возврат из нативного flow Authentik (user settings /
+ *      password change). SPA перед открытием flow положила в
+ *      sessionStorage ключ "post_flow_redirect" со значением
+ *      "/profile". После обработки вернёмся туда.
  *
  * ВАЖНО:
  *   Обработка запускается РОВНО ОДИН РАЗ за всю жизнь компонента.
@@ -45,8 +51,6 @@ const AuthCallback: React.FC = () => {
 
     useEffect(() => {
         // Если уже обрабатывали — молча выходим.
-        // Это защита от StrictMode и от повторных срабатываний
-        // useEffect при ре-рендерах AuthProvider.
         if (isProcessing.current) {
             return;
         }
@@ -72,10 +76,6 @@ const AuthCallback: React.FC = () => {
 
                 // Обновляем контекст аутентификации (подтягиваем user
                 // из userinfo в React-состояние AuthProvider).
-                //
-                // Если refreshUser кинет ошибку — это не критично,
-                // токен уже сохранён, и следующий переход по приложению
-                // либо отработает, либо отправит пользователя на /login.
                 try {
                     await refreshUser();
                 } catch (refreshErr) {
@@ -85,8 +85,17 @@ const AuthCallback: React.FC = () => {
                     );
                 }
 
-                // Редирект на главную.
-                navigate("/", { replace: true });
+                // Определяем, куда навигировать.
+                //
+                // Если SPA положила в sessionStorage значение
+                // post_flow_redirect (перед открытием user settings
+                // или password change flow) — возвращаемся туда.
+                // Иначе — на "/" (обычный логин).
+                const returnPath =
+                    sessionStorage.getItem("post_flow_redirect") || "/";
+                sessionStorage.removeItem("post_flow_redirect");
+
+                navigate(returnPath, { replace: true });
             } catch (err: any) {
                 console.error("Callback error:", err);
                 setError(
@@ -99,10 +108,6 @@ const AuthCallback: React.FC = () => {
         handleCallback();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
-    // ↑ Пустые зависимости — эффект срабатывает один раз при монтировании.
-    //   searchParams/navigate/refreshUser читаются из замыкания первого
-    //   рендера. Для этого сценария это корректно: URL /auth/callback?...
-    //   не меняется за время жизни компонента, а navigate стабилен.
 
     if (error) {
         return (

@@ -133,31 +133,41 @@ entries:
         }
 
   # ============================================================
-  # FLOW АВТОРИЗАЦИИ С ПОЛНОЦЕННОЙ АУТЕНТИФИКАЦИЕЙ
+  # FLOW АВТОРИЗАЦИИ (НЕ ИСПОЛЬЗУЕТСЯ ПРОВАЙДЕРОМ)
   #
-  # ЗАЧЕМ ЭТО НУЖНО:
+  # ВНИМАНИЕ: провайдер provider-uchaly использует ДЕФОЛТНЫЙ
+  # flow авторизации Authentik
+  # (default-provider-authorization-implicit-consent), а не этот.
+  #
+  # Этот кастомный flow оставлен в blueprint на случай, если
+  # когда-нибудь понадобится вернуться к форсированному перелогину
+  # (пользователь вводит логин/пароль при КАЖДОМ /authorize/).
+  #
+  # ЕСЛИ НЕ ПЛАНИРУЕТЕ ВОЗВРАЩАТЬСЯ — можно удалить вместе с
+  # привязками bind-uchaly-ident / bind-uchaly-pass / bind-uchaly-login.
+  #
+  # ЗАЧЕМ БЫЛ НУЖЕН РАНЬШЕ:
   #   Стандартный flow "default-provider-authorization-implicit-consent"
   #   содержит только стадию consent и НЕ содержит стадий ввода
   #   логина/пароля. Из-за этого:
   #
-  #   1. Параметр prompt=login, который мы шлём из фронтенда в
-  #      /application/o/authorize/, игнорируется — Authentik просто
-  #      переиспользует существующую сессию (cookie authentik_session),
-  #      если она есть.
-  #   2. Возникает "SSO-эффект": пользователь не может перелогиниться
+  #   1. Параметр prompt=login игнорировался — Authentik просто
+  #      переиспользовал существующую сессию (cookie authentik_session).
+  #   2. Возникал "SSO-эффект": пользователь не мог перелогиниться
   #      под другой учётной записью, потому что форма входа не
-  #      показывается.
+  #      показывалась.
   #
-  #   Наш flow явно требует identification → password → user_login
-  #   при КАЖДОМ запросе к /authorize/. Это заставляет Authentik
-  #   всегда показывать форму ввода логина/пароля — то есть даёт
-  #   пользователю возможность сменить пользователя.
+  #   Кастомный flow явно требовал identification → password → user_login
+  #   при КАЖДОМ запросе к /authorize/.
   #
-  # ПОЛЕ authentication:
-  #   "none" означает, что flow запускается независимо от того,
-  #   есть ли у пользователя активная сессия Authentik. Если бы
-  #   стояло "require", flow не запускался бы при наличии сессии,
-  #   и мы бы вернулись к той же проблеме.
+  # ПОЧЕМУ ОТКАЗАЛИСЬ:
+  #   Такой подход ломает silent-возврат из user settings flow
+  #   и password change flow: после редактирования ФИО пользователь
+  #   должен снова вводить логин/пароль, что плохой UX.
+  #
+  #   Стандартный подход: сессия живёт, пока пользователь не нажмёт
+  #   "Выйти". Именно fullLogout() убивает сессию Authentik, а
+  #   следующий вход снова показывает форму логина.
   # ============================================================
   - model: authentik_flows.flow
     id: flow-uchaly-oauth-authorize
@@ -170,12 +180,6 @@ entries:
       authentication: none
 
   # --- Стадия 1: identification (ввод username/email) ---
-  #
-  # Пользователь вводит свой username или email. Authentik ищет
-  # совпадение в базе и передаёт управление следующей стадии.
-  # Стадия "default-authentication-identification" создаётся
-  # автоматически при первом запуске Authentik и уже привязана
-  # к дефолтному authentication-flow. Мы просто переиспользуем её.
   - model: authentik_flows.flowstagebinding
     id: bind-uchaly-ident
     identifiers:
@@ -187,10 +191,6 @@ entries:
       re_evaluate_policies: false
 
   # --- Стадия 2: password (ввод пароля) ---
-  #
-  # Проверка пароля. Стадия "default-authentication-password"
-  # также создаётся автоматически. Здесь задаются требования к
-  # паролю (длина, сложность) и поведение при неудачных попытках.
   - model: authentik_flows.flowstagebinding
     id: bind-uchaly-pass
     identifiers:
@@ -202,11 +202,6 @@ entries:
       re_evaluate_policies: false
 
   # --- Стадия 3: user_login (устанавливает сессию) ---
-  #
-  # Устанавливает cookie authentik_session и редиректит
-  # пользователя обратно в flow, который его вызвал (в нашем
-  # случае — обратно в OAuth2 authorize, где будет выпущен
-  # authorization code).
   - model: authentik_flows.flowstagebinding
     id: bind-uchaly-login
     identifiers:
@@ -218,22 +213,28 @@ entries:
       re_evaluate_policies: false
 
   # ============================================================
-  # FLOW ИНВАЛИДАЦИИ (полный выход)
+  # FLOW ИНВАЛИДАЦИИ (ИСПОЛЬЗУЕТСЯ ПРОВАЙДЕРОМ)
+  #
+  # Провайдер provider-uchaly указывает на ЭТОТ flow в поле
+  # invalidation_flow.
   #
   # ЗАЧЕМ ЭТО НУЖНО:
-  #   Стандартный "default-provider-invalidation-flow" рендерит
-  #   промежуточную страницу с вопросом "Вы уверены, что хотите
-  #   выйти?" и требует клика. Если пользователь не кликнет —
-  #   сессия останется живой.
+  #   Стандартный "default-provider-invalidation-flow" содержит
+  #   Consent Stage — страницу «Вы уверены, что хотите выйти?».
+  #   При прямом редиректе на /end-session/ (как это делает
+  #   authService.fullLogout()) никто не нажимает «Подтвердить»,
+  #   и сессия Authentik НЕ убивается. Пользователь редиректится
+  #   обратно в SPA, но cookie authentik_session остаётся живой.
+  #   Следующий клик «Войти» автоматически восстанавливает сессию —
+  #   а мы хотим, чтобы пользователь вводил пароль заново.
   #
   #   Наш flow содержит ТОЛЬКО стадию user_logout без consent.
-  #   При заходе на end-session Authentik сразу инвалидирует
-  #   сессию и делает 302-редирект на post_logout_redirect_uri.
+  #   При заходе на end-session Authentik сразу убивает сессию
+  #   и делает 302-редирект на post_logout_redirect_uri.
   #
-  #   Это решает проблему, когда после "Выйти" и возврата в SPA
-  #   пользователь по кнопке "Войти" снова оказывается
-  #   залогиненным без ввода пароля — потому что сессия Authentik
-  #   не убивалась.
+  #   Это решает проблему, когда после «Выйти» и возврата в SPA
+  #   пользователь по кнопке «Войти» снова оказывается
+  #   залогиненным без ввода пароля.
   # ============================================================
   - model: authentik_flows.flow
     id: flow-uchaly-invalidation
@@ -634,6 +635,416 @@ entries:
       re_evaluate_policies: false
 
   # ============================================================
+  # USER SETTINGS FLOW — РЕДАКТИРОВАНИЕ ПРОФИЛЯ
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   Пользователь должен иметь возможность менять свои ФИО
+  #   (фамилия, имя, отчество) без участия администратора и
+  #   без Gateway. Authentik предоставляет для этого нативный
+  #   интерфейс через flow с designation="stage_configuration".
+  #
+  #   Такой flow доступен по URL /if/flow/<slug>/ и требует
+  #   активной сессии Authentik (authentication: require_authenticated).
+  #
+  # КАК ЭТО РАБОТАЕТ:
+  #   1. Пользователь открывает /if/flow/uchaly-user-settings/
+  #      (или переходит туда по ссылке из SPA).
+  #   2. Flow executor показывает Prompt Stage с текущими
+  #      значениями атрибутов пользователя (attributes.family_name
+  #      и т.д.) — они предзаполнены.
+  #   3. Пользователь меняет значения, нажимает «Сохранить».
+  #   4. User Write Stage записывает новые значения в
+  #      user.attributes.family_name / given_name / middle_name.
+  #   5. Flow завершается, пользователь возвращается в SPA
+  #      (см. параметр next в URL flow).
+  #
+  # ВАЖНО ПРО EMAIL:
+  #   Email НЕ включён в Prompt Stage — его нельзя менять
+  #   из этого flow. Дополнительно на уровне атрибутов
+  #   пользователя выставлен флаг
+  #   goauthentik.io/user/can-change-email: false (см. ниже),
+  #   который блокирует смену email и через стандартный
+  #   интерфейс /if/user/.
+  #
+  # ВАЖНО ПРО ПРЕДЗАПОЛНЕНИЕ:
+  #   Prompt Stage НЕ подставляет текущие значения автоматически —
+  #   нужно явно указать выражение. Для этого используются два поля:
+  #
+  #     initial_value — выражение Python, которое выполняется при
+  #       каждом рендере формы. Имеет доступ к объекту `user`
+  #       (текущий аутентифицированный пользователь).
+  #
+  #     initial_value_expression: true — обязательный флаг.
+  #       Без него Authentik воспримет initial_value как литерал
+  #       и покажет пользователю текст выражения вместо реального
+  #       значения.
+  #
+  # ВАЖНО ПРО designation:
+  #   designation="stage_configuration" — это специальный тип flow,
+  #   который используется как «настройки» из интерфейса /if/user/.
+  #   Не путать с "enrollment" (регистрация) и "authorization"
+  #   (вход через OAuth2).
+  # ============================================================
+  - model: authentik_flows.flow
+    id: flow-uchaly-user-settings
+    identifiers:
+      slug: uchaly-user-settings
+    attrs:
+      name: "Uchaly User Settings"
+      title: "Настройки профиля"
+      designation: stage_configuration
+      authentication: require_authenticated
+
+  # --- Prompt-объекты для редактирования ФИО ---
+  #
+  # Каждое поле — отдельная запись модели authentik_stages_prompt.prompt.
+  # field_key с префиксом "attributes." заставляет User Write Stage
+  # записывать значение в JSONB-поле user.attributes.
+  #
+  # Атрибут "required: false" для отчества — у пользователя может
+  # не быть отчества (иностранные сотрудники и т.п.).
+  #
+  # order определяет порядок полей в форме.
+  - model: authentik_stages_prompt.prompt
+    id: prompt-settings-family-name
+    identifiers:
+      name: "Uchaly Settings Family Name"
+    attrs:
+      field_key: attributes.family_name
+      label: "Фамилия"
+      type: text
+      required: true
+      placeholder: "Иванов"
+      order: 10
+      # Предзаполняем текущим значением из user.attributes.family_name.
+      initial_value: |
+        return user.attributes.get("family_name", "")
+      initial_value_expression: true
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-settings-given-name
+    identifiers:
+      name: "Uchaly Settings Given Name"
+    attrs:
+      field_key: attributes.given_name
+      label: "Имя"
+      type: text
+      required: true
+      placeholder: "Иван"
+      order: 20
+      # Предзаполняем текущим значением из user.attributes.given_name.
+      initial_value: |
+        return user.attributes.get("given_name", "")
+      initial_value_expression: true
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-settings-middle-name
+    identifiers:
+      name: "Uchaly Settings Middle Name"
+    attrs:
+      field_key: attributes.middle_name
+      label: "Отчество"
+      type: text
+      required: false
+      placeholder: "Иванович"
+      order: 30
+      # Предзаполняем текущим значением из user.attributes.middle_name.
+      # Отчество опционально, поэтому пустая строка — валидное
+      # значение по умолчанию.
+      initial_value: |
+        return user.attributes.get("middle_name", "")
+      initial_value_expression: true
+
+  # --- Prompt Stage: контейнер для полей ФИО ---
+  #
+  # Этот stage собирает все prompt-поля в одну форму.
+  # Валидация ограничена встроенными правилами (required, type).
+  # При необходимости сюда можно добавить validation_policies
+  # с Expression Policy для дополнительных проверок.
+  - model: authentik_stages_prompt.promptstage
+    id: stage-settings-prompt
+    identifiers:
+      name: "Uchaly Settings Prompt"
+    attrs:
+      fields:
+        - !KeyOf prompt-settings-family-name
+        - !KeyOf prompt-settings-given-name
+        - !KeyOf prompt-settings-middle-name
+      validation_policies: []
+
+  # --- User Write Stage: записывает изменения в профиль ---
+  #
+  # user_creation_mode: never_create — этот stage НЕ создаёт
+  # новых пользователей. Он только обновляет существующего
+  # (того, кто прошёл аутентификацию и открыл flow).
+  #
+  # create_users_as_inactive и create_users_group не указываются,
+  # потому что они применимы только при создании нового
+  # пользователя, а мы работаем в режиме never_create.
+  #
+  # ВАЖНО: User Write Stage автоматически подхватывает
+  # значения из Prompt Stage и записывает их в соответствующие
+  # поля модели User. Для field_key с префиксом "attributes."
+  # значения идут в JSONB-поле user.attributes.
+  - model: authentik_stages_user_write.userwritestage
+    id: stage-settings-user-write
+    identifiers:
+      name: "Uchaly Settings User Write"
+    attrs:
+      user_creation_mode: never_create
+      create_users_as_inactive: false
+
+  # --- Привязки stages к flow (порядок важен) ---
+  #
+  # order: 10 — сначала Prompt Stage (показываем форму).
+  # order: 20 — потом User Write Stage (сохраняем изменения).
+  #
+  # Больше stages в этом flow не нужно: аутентификация уже
+  # пройдена (authentication: require_authenticated), а логин
+  # повторять не надо — пользователь уже в сессии Authentik.
+  - model: authentik_flows.flowstagebinding
+    id: bind-settings-prompt
+    identifiers:
+      target: !KeyOf flow-uchaly-user-settings
+      stage: !KeyOf stage-settings-prompt
+      order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  - model: authentik_flows.flowstagebinding
+    id: bind-settings-user-write
+    identifiers:
+      target: !KeyOf flow-uchaly-user-settings
+      stage: !KeyOf stage-settings-user-write
+      order: 20
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # ============================================================
+  # PASSWORD CHANGE FLOW — СМЕНА ПАРОЛЯ
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   Пользователь должен иметь возможность сменить пароль,
+  #   зная текущий. Authentik предоставляет готовый
+  #   default-password-change flow, но мы создаём собственный,
+  #   чтобы:
+  #     1. Использовать наши названия (локализация).
+  #     2. Не зависеть от изменений в default-флоу при обновлении
+  #        Authentik.
+  #     3. Явно контролировать состав stages.
+  #
+  # СОСТАВ FLOW:
+  #   1. Password Stage — проверяет текущий пароль пользователя.
+  #      Это ключевой stage: он подтверждает, что пользователь
+  #      знает свой текущий пароль, прежде чем разрешить смену.
+  #      Без него смена пароля была бы небезопасной.
+  #   2. Prompt Stage — форма с двумя полями: новый пароль и
+  #      подтверждение. Оба поля типа password.
+  #   3. User Write Stage — записывает новый пароль в модель
+  #      пользователя.
+  #
+  # ВАЖНО ПРО PASSWORD STAGE:
+  #   Мы создаём собственную Password Stage, потому что в
+  #   дефолтном default-authentication-password могут быть
+  #   настройки, которые нам не подходят. Наша версия проверяет
+  #   пароль через бэкенды InbuiltBackend и TokenBackend.
+  #
+  # ВАЖНО ПРО PROMPT STAGE:
+  #   Оба поля (password и password_repeat) имеют type=password.
+  #   Это скрывает вводимые символы и показывает индикатор
+  #   сложности пароля.
+  #
+  #   Валидация соответствия двух полей выполняется
+  #   автоматически Prompt Stage'ом — для этого поле
+  #   password_repeat должно иметь field_key=password_repeat
+  #   (это зарезервированное имя, которое Prompt Stage
+  #   автоматически сверяет с полем password).
+  #
+  # ВАЖНО ПРО designation:
+  #   designation="stage_configuration" — используется для
+  #   flow, вызываемых из интерфейса /if/user/ как настройки.
+  #   Это тот же designation, что и у user settings flow выше.
+  # ============================================================
+  - model: authentik_flows.flow
+    id: flow-uchaly-password-change
+    identifiers:
+      slug: uchaly-password-change
+    attrs:
+      name: "Uchaly Password Change"
+      title: "Смена пароля"
+      designation: stage_configuration
+      authentication: require_authenticated
+
+  # --- Password Stage: проверка текущего пароля ---
+  #
+  # ВАЖНО: этот stage проверяет именно ТЕКУЩИЙ пароль
+  # пользователя. Если пароль неверный — flow прерывается,
+  # пользователь видит ошибку и не может продолжить
+  # смену пароля.
+  #
+  # ПОЛЯ:
+  #   backends — список бэкендов проверки пароля. Мы используем
+  #     InbuiltBackend (проверка по БД пользователей Authentik)
+  #     и TokenBackend (проверка по app-паролям Authentik).
+  #   failed_attempts_before_cancel — сколько неудачных попыток
+  #     разрешено, прежде чем flow прервётся. 5 — разумное значение.
+  #   allow_show_password — показывать ли кнопку «глаз» для
+  #     отображения введённого пароля. Мы ставим false для
+  #     безопасности.
+  - model: authentik_stages_password.passwordstage
+    id: stage-password-change-check
+    identifiers:
+      name: "Uchaly Password Change Check"
+    attrs:
+      backends:
+        - authentik.core.auth.InbuiltBackend
+        - authentik.core.auth.TokenBackend
+      failed_attempts_before_cancel: 5
+      allow_show_password: false
+
+  # --- Prompt-объекты для нового пароля ---
+  #
+  # password — основное поле нового пароля.
+  # password_repeat — подтверждение. Prompt Stage автоматически
+  # проверяет, что значения совпадают.
+  #
+  # field_key="password" и field_key="password_repeat" — это
+  # зарезервированные имена, которые User Write Stage
+  # распознаёт и записывает в поле password модели User.
+  - model: authentik_stages_prompt.prompt
+    id: prompt-password-new
+    identifiers:
+      name: "Uchaly Password New"
+    attrs:
+      field_key: password
+      label: "Новый пароль"
+      type: password
+      required: true
+      placeholder: "Введите новый пароль"
+      order: 10
+
+  - model: authentik_stages_prompt.prompt
+    id: prompt-password-repeat
+    identifiers:
+      name: "Uchaly Password Repeat"
+    attrs:
+      field_key: password_repeat
+      label: "Повторите новый пароль"
+      type: password
+      required: true
+      placeholder: "Повторите новый пароль"
+      order: 20
+
+  # --- Prompt Stage: форма нового пароля ---
+  #
+  # Этот stage собирает два prompt-поля в одну форму.
+  # Валидация соответствия password и password_repeat
+  # выполняется автоматически — пользователь не сможет
+  # завершить flow, если пароли не совпадают.
+  - model: authentik_stages_prompt.promptstage
+    id: stage-password-change-prompt
+    identifiers:
+      name: "Uchaly Password Change Prompt"
+    attrs:
+      fields:
+        - !KeyOf prompt-password-new
+        - !KeyOf prompt-password-repeat
+      validation_policies: []
+
+  # --- User Write Stage: запись нового пароля ---
+  #
+  # user_creation_mode: never_create — пароль записывается
+  # существующему пользователю (тому, кто прошёл Password Stage).
+  #
+  # Этот stage распознаёт field_key="password" и записывает
+  # значение в поле password модели User, хешируя его
+  # через стандартный механизм Django.
+  - model: authentik_stages_user_write.userwritestage
+    id: stage-password-change-write
+    identifiers:
+      name: "Uchaly Password Change User Write"
+    attrs:
+      user_creation_mode: never_create
+      create_users_as_inactive: false
+
+  # --- Привязки stages к flow (порядок важен) ---
+  #
+  # order: 10 — Password Stage (проверяем текущий пароль).
+  # order: 20 — Prompt Stage (вводим новый пароль).
+  # order: 30 — User Write Stage (сохраняем новый пароль).
+  - model: authentik_flows.flowstagebinding
+    id: bind-password-check
+    identifiers:
+      target: !KeyOf flow-uchaly-password-change
+      stage: !KeyOf stage-password-change-check
+      order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  - model: authentik_flows.flowstagebinding
+    id: bind-password-prompt
+    identifiers:
+      target: !KeyOf flow-uchaly-password-change
+      stage: !KeyOf stage-password-change-prompt
+      order: 20
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  - model: authentik_flows.flowstagebinding
+    id: bind-password-write
+    identifiers:
+      target: !KeyOf flow-uchaly-password-change
+      stage: !KeyOf stage-password-change-write
+      order: 30
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # ============================================================
+  # ГЛОБАЛЬНЫЕ НАСТРОЙКИ BRAND
+  #
+  # ЗАЧЕМ ЭТО НУЖНО:
+  #   Default user settings определяют поведение интерфейса
+  #   /if/user/ для всех пользователей. Здесь мы явно фиксируем
+  #   три настройки:
+  #
+  #   1. default_user_change_email: false
+  #      Пользователь НЕ может менять свой email.
+  #
+  #   2. default_user_change_name: true
+  #      Пользователь МОЖЕТ менять своё ФИО (через наш
+  #      user settings flow).
+  #
+  #   3. default_user_change_username: false
+  #      Пользователь НЕ может менять свой username.
+  #
+  # ВАЖНО ПРО ВЕРСИЮ:
+  #   В Authentik 2024.2 и новее модель authentik_tenants.tenant
+  #   была переименована в authentik_brands.brand. Все настройки
+  #   default_user_change_* теперь находятся там.
+  #
+  # ВАЖНО ПРО БЕЗОПАСНОСТЬ:
+  #   Этот блок переопределяет ТОЛЬКО три поля brand'а, потому что
+  #   blueprint по умолчанию частично обновляет существующий объект
+  #   (merge), а не создаёт новый. Если вы уже меняли брендинг в UI
+  #   и не хотите рисковать — используйте ENV-переменные:
+  #     AUTHENTIK_DEFAULT_USER_CHANGE_EMAIL=false
+  #     AUTHENTIK_DEFAULT_USER_CHANGE_NAME=true
+  #     AUTHENTIK_DEFAULT_USER_CHANGE_USERNAME=false
+  # ============================================================
+  - model: authentik_brands.brand
+    identifiers:
+      domain: "authentik-default"
+    attrs:
+      default_user_change_email: false
+      default_user_change_name: true
+      default_user_change_username: false
+
+  # ============================================================
   # ТЕСТОВЫЕ ПОЛЬЗОВАТЕЛИ
   # ВНИМАНИЕ: это тестовые учётные записи для разработки.
   # Перед выводом в production — удалить или заменить на реальные.
@@ -650,6 +1061,13 @@ entries:
   #   "Uchaly: Profile Claim" корректно отдавал их в userinfo.
   #   Поле name (единое) тоже оставляем заполненным — оно
   #   используется в админке Authentik для отображения.
+  #
+  # ВАЖНО ПРО ЗАПРЕТ СМЕНЫ EMAIL:
+  #   Каждому тестовому пользователю явно прописан атрибут
+  #   goauthentik.io/user/can-change-email: false. Это дублирует
+  #   глобальную настройку default_user_change_email: false
+  #   и делает запрет максимально явным — при чтении blueprint
+  #   сразу видно, что email менять нельзя.
   # ============================================================
 
   # --- admin ---
@@ -668,6 +1086,22 @@ entries:
         family_name: "Администраторов"
         given_name: "Админ"
         middle_name: "Админович"
+        # ========================================================
+        # ЗАПРЕТ СМЕНЫ EMAIL
+        #
+        # Этот атрибут блокирует возможность пользователя
+        # менять свой email через интерфейс /if/user/ и через
+        # user settings flow. Значение false означает «запрещено».
+        #
+        # Атрибут работает в дополнение к глобальной настройке
+        # default_user_change_email (см. выше) и переопределяет
+        # её для конкретного пользователя.
+        #
+        # ВАЖНО: этот атрибут НЕ влияет на возможность
+        # администратора менять email через Admin API или
+        # Admin interface — только на self-service.
+        # ========================================================
+        goauthentik.io/user/can-change-email: false
       password: "Admin123!"
 
   # --- manager ---
@@ -685,6 +1119,7 @@ entries:
         family_name: "Менеджеров"
         given_name: "Джон"
         middle_name: "Иванович"
+        goauthentik.io/user/can-change-email: false
       password: "Manager123!"
 
   # --- diagnost ---
@@ -702,6 +1137,7 @@ entries:
         family_name: "Диагностов"
         given_name: "Джон"
         middle_name: "Иванович"
+        goauthentik.io/user/can-change-email: false
       password: "Diagnost123!"
 
   # --- ElectroService ---
@@ -719,6 +1155,7 @@ entries:
         family_name: "Электросервисов"
         given_name: "Сервис"
         middle_name: "Сервисович"
+        goauthentik.io/user/can-change-email: false
       password: "Service123!"
 
   # --- MexService ---
@@ -736,6 +1173,7 @@ entries:
         family_name: "Мехсервисов"
         given_name: "Сервис"
         middle_name: "Сервисович"
+        goauthentik.io/user/can-change-email: false
       password: "Service123!"
 
   # ============================================================
@@ -778,16 +1216,39 @@ entries:
   # OAUTH2 / OIDC ПРОВАЙДЕР
   # ВАЖНО: поле называется redirect_uris (не allowed_redirect_uris).
   #
-  # КЛЮЧЕВОЕ ИЗМЕНЕНИЕ:
-  #   authorization_flow теперь указывает на НАШ flow
-  #   "Uchaly OAuth2 Authorization" (см. выше), который содержит
-  #   стадии identification + password + user_login. Именно это
-  #   заставляет Authentik показывать форму логина при каждом
-  #   запросе к /authorize/, а не молча переиспользовать сессию.
+  # ГИБРИДНАЯ СХЕМА FLOW (ключевое решение):
   #
-  #   invalidation_flow теперь указывает на НАШ flow
-  #   "Uchaly Invalidation", который сразу убивает сессию без
-  #   промежуточной consent-страницы.
+  #   authorization_flow:
+  #     Используем ДЕФОЛТНЫЙ flow Authentik
+  #     (default-provider-authorization-implicit-consent).
+  #     Он уважает параметр prompt=none — если пользователь
+  #     уже аутентифицирован, форма логина не показывается,
+  #     сразу выпускается authorization code.
+  #
+  #     Это критично для silent-возврата из user settings flow
+  #     и password change flow: после редактирования ФИО
+  #     пользователь не должен вводить пароль заново.
+  #
+  #   invalidation_flow:
+  #     Используем НАШ кастомный flow (flow-uchaly-invalidation),
+  #     а НЕ дефолтный default-provider-invalidation-flow.
+  #
+  #     Причина: дефолтный flow содержит Consent Stage —
+  #     страницу «Вы уверены, что хотите выйти?». При прямом
+  #     редиректе на /end-session/ (как это делает
+  #     authService.fullLogout()) никто не нажимает
+  #     «Подтвердить», и сессия Authentik НЕ убивается.
+  #     Пользователь редиректится обратно в SPA, но cookie
+  #     authentik_session остаётся живой. Следующий клик
+  #     «Войти» автоматически восстанавливает сессию — а мы
+  #     хотим, чтобы пользователь вводил пароль заново.
+  #
+  #     Наш кастомный flow содержит ТОЛЬКО стадию user_logout.
+  #     При заходе на end-session Authentik сразу убивает
+  #     сессию и делает 302-редирект на post_logout_redirect_uri.
+  #
+  #     Именно так решается задача «выйти → войти → увидеть
+  #     форму логина снова».
   #
   # ВАЖНО ПРО grant_types (2026.8.3+):
   #   Начиная с 2026.8 у OAuth2Provider появилось обязательное поле
@@ -860,14 +1321,32 @@ entries:
         - "http://localhost/"
         - "http://10.0.9.100:62080/"
 
-      # ⬇⬇⬇ НАШ FLOW АВТОРИЗАЦИИ С АУТЕНТИФИКАЦИЕЙ ⬇⬇⬇
-      # Вместо default-provider-authorization-implicit-consent,
-      # который не содержит стадий ввода логина/пароля.
-      authorization_flow: !KeyOf flow-uchaly-oauth-authorize
+      # ⬇⬇⬇ ДЕФОЛТНЫЙ FLOW АВТОРИЗАЦИИ AUTHENTIK ⬇⬇⬇
+      #
+      # Стандартный flow Authentik. Уважает prompt=none — если
+      # пользователь уже аутентифицирован, форма логина не
+      # показывается, сразу выпускается authorization code.
+      #
+      # Это нужно для silent-возврата из user settings flow
+      # и password change flow (без повторного ввода пароля).
+      authorization_flow: !Find [authentik_flows.flow, [slug, "default-provider-authorization-implicit-consent"]]
 
-      # ⬇⬇⬇ НАШ FLOW ИНВАЛИДАЦИИ БЕЗ CONSENT ⬇⬇⬇
-      # Вместо default-provider-invalidation-flow, который
-      # показывает промежуточную страницу с вопросом.
+      # ⬇⬇⬇ НАШ FLOW ИНВАЛИДАЦИИ (БЕЗ CONSENT) ⬇⬇⬇
+      #
+      # ВАЖНО: НЕ используем дефолтный
+      # default-provider-invalidation-flow, потому что он
+      # содержит Consent Stage — страницу «Вы уверены, что
+      # хотите выйти?». При прямом редиректе на /end-session/
+      # (как это делает SPA через authService.fullLogout())
+      # никто не нажимает «Подтвердить», и сессия Authentik
+      # НЕ убивается. Пользователь редиректится обратно в SPA,
+      # но cookie authentik_session остаётся живой. Следующий
+      # вход автоматически восстанавливает сессию.
+      #
+      # Наш кастомный flow (flow-uchaly-invalidation) содержит
+      # ТОЛЬКО стадию user_logout без consent. При заходе на
+      # end-session Authentik сразу убивает сессию и делает
+      # 302-редирект на post_logout_redirect_uri.
       invalidation_flow: !KeyOf flow-uchaly-invalidation
 
       # ⬇⬇⬇ НАШ FLOW РЕГИСТРАЦИИ ⬇⬇⬇

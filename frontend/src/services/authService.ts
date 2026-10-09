@@ -7,15 +7,26 @@
  *   - loginWithAuthentik() — запускает OAuth2 Authorization Code Flow с PKCE,
  *     редиректит браузер на страницу входа Authentik.
  *   - registerWithAuthentik() — запускает регистрацию нового пользователя
- *     через enrollment-flow Authentik. После успешной регистрации
- *     пользователь автоматически попадает обратно в SPA уже аутентифицированным
- *     (за счёт того, что next указывает на OAuth2-authorize URL, который
- *     выпускает code и редиректит на redirect_uri).
+ *     через enrollment-flow Authentik.
  *   - handleCallback(code, state) — обменивает authorization code на токены,
  *     загружает профиль пользователя и сохраняет всё в localStorage.
  *   - refreshToken() — обновляет access-токен через refresh-токен.
  *   - logout() — локальный выход (без завершения сессии Authentik).
  *   - fullLogout() — полный выход с завершением сессии Authentik.
+ *
+ * РЕДАКТИРОВАНИЕ ПРОФИЛЯ И СМЕНА ПАРОЛЯ:
+ *   Эти операции выполняются НЕ через Gateway, а через нативные
+ *   flow Authentik. Сервис предоставляет методы
+ *   getUserSettingsFlowUrl() и getPasswordChangeFlowUrl(),
+ *   которые возвращают URL соответствующих flow. SPA делает
+ *   редирект браузера на эти URL — пользователь видит нативный
+ *   интерфейс Authentik, где и выполняет операцию.
+ *
+ *   Такой подход:
+ *     - Не требует AdminToken на Gateway (безопаснее).
+ *     - Использует штатные механизмы Authentik (проверка
+ *       текущего пароля выполняется Password Stage).
+ *     - Исключает передачу пароля через промежуточные сервисы.
  *
  * Администрирование пользователей и групп вынесено в отдельный сервис:
  *   - adminService.ts (см. соседний файл).
@@ -63,6 +74,18 @@ const AUTHENTIK_APP_SLUG = "uchaly";
  * регистрации: /if/flow/<slug>/
  */
 const ENROLLMENT_FLOW_SLUG = "uchaly-enrollment";
+
+/**
+ * Slug user settings flow — редактирование профиля.
+ * Используется в getUserSettingsFlowUrl().
+ */
+const USER_SETTINGS_FLOW_SLUG = "uchaly-user-settings";
+
+/**
+ * Slug password change flow — смена пароля.
+ * Используется в getPasswordChangeFlowUrl().
+ */
+const PASSWORD_CHANGE_FLOW_SLUG = "uchaly-password-change";
 
 /**
  * Client ID, настроенный в OAuth2-провайдере Authentik.
@@ -512,6 +535,118 @@ export const authService = {
         window.location.href = `${END_SESSION_URL}?${params.toString()}`;
     },
 
+    /**
+     * Возвращает URL user settings flow Authentik —
+     * редактирование профиля (ФИО).
+     *
+     * ПОЧЕМУ ASYNC:
+     *   Мы генерируем PKCE прямо здесь, потому что после flow
+     *   пользователь вернётся в SPA через OAuth2-authorize, и нам
+     *   понадобится code_verifier для обмена code на токены в
+     *   AuthCallback. SHA-256 (часть PKCE) — асинхронный API.
+     *
+     * ПОЧЕМУ НЕ next=абсолютный_URL:
+     *   Flow executor Authentik блокирует абсолютные URL в `next`.
+     *   Обходим это так же, как в registerWithAuthentik():
+     *   передаём относительный путь на /application/o/authorize/,
+     *   который выпустит свежий authorization code и редиректит
+     *   на redirect_uri SPA (http://localhost:62080/auth/callback).
+     *
+     * КУДА ВЕРНЁТСЯ ПОЛЬЗОВАТЕЛЬ:
+     *   Мы сохраняем returnPath в sessionStorage под ключом
+     *   "post_flow_redirect". AuthCallback после успешного обмена
+     *   токенов прочитает его и навигирует туда.
+     *
+     * @param returnPath — куда вернуть пользователя после flow.
+     *                     По умолчанию "/profile".
+     */
+    async getUserSettingsFlowUrl(returnPath: string = "/profile"): Promise<string> {
+        // 1. Генерируем PKCE (как для обычного логина)
+        const codeVerifier = generateRandomString(64);
+        const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+        // 2. Генерируем state для CSRF-защиты
+        const state = generateRandomString(32);
+
+        // 3. Сохраняем verifier и state — AuthCallback сверит их
+        sessionStorage.setItem(STORAGE_KEYS.pkceVerifier, codeVerifier);
+        sessionStorage.setItem(STORAGE_KEYS.oauthState, state);
+
+        // 4. Запоминаем, куда вернуть пользователя после flow.
+        //    AuthCallback прочитает этот ключ и навигирует туда.
+        sessionStorage.setItem("post_flow_redirect", returnPath);
+
+        // 5. Строим authorize URL, который будет передан в `next`.
+        //    prompt=none — критично: пользователь уже аутентифицирован,
+        //    повторно показывать форму логина не нужно.
+        const authorizeParams = new URLSearchParams({
+            client_id: CLIENT_ID,
+            redirect_uri: REDIRECT_URI,
+            response_type: "code",
+            scope: OAUTH_SCOPES,
+            state,
+            code_challenge: codeChallenge,
+            code_challenge_method: "S256",
+            prompt: "none",
+        });
+
+        // 6. ВАЖНО: authorize URL ОТНОСИТЕЛЬНЫЙ (начинается с /).
+        //    Абсолютный (http://...) Authentik отклонит.
+        const authorizePath = `/application/o/authorize/?${authorizeParams.toString()}`;
+
+        // 7. Собираем URL flow с next=authorizePath
+        const flowParams = new URLSearchParams({
+            next: authorizePath,
+        });
+
+        return `${AUTHENTIK_BASE_URL}/if/flow/${USER_SETTINGS_FLOW_SLUG}/?${flowParams.toString()}`;
+    },
+
+    /**
+     * Возвращает URL password change flow Authentik — смена пароля.
+     *
+     * Логика полностью аналогична getUserSettingsFlowUrl:
+     * генерируем PKCE, сохраняем returnPath, оборачиваем
+     * authorize URL в next.
+     *
+     * @param returnPath — куда вернуть пользователя после flow.
+     *                     По умолчанию "/profile".
+     */
+    async getPasswordChangeFlowUrl(returnPath: string = "/profile"): Promise<string> {
+        // 1. Генерируем PKCE
+        const codeVerifier = generateRandomString(64);
+        const codeChallenge = await generateCodeChallenge(codeVerifier);
+
+        // 2. Генерируем state
+        const state = generateRandomString(32);
+
+        // 3. Сохраняем
+        sessionStorage.setItem(STORAGE_KEYS.pkceVerifier, codeVerifier);
+        sessionStorage.setItem(STORAGE_KEYS.oauthState, state);
+        sessionStorage.setItem("post_flow_redirect", returnPath);
+
+        // 4. Строим authorize URL с prompt=none
+        const authorizeParams = new URLSearchParams({
+            client_id: CLIENT_ID,
+            redirect_uri: REDIRECT_URI,
+            response_type: "code",
+            scope: OAUTH_SCOPES,
+            state,
+            code_challenge: codeChallenge,
+            code_challenge_method: "S256",
+            prompt: "none",
+        });
+
+        const authorizePath = `/application/o/authorize/?${authorizeParams.toString()}`;
+
+        // 5. Собираем URL flow
+        const flowParams = new URLSearchParams({
+            next: authorizePath,
+        });
+
+        return `${AUTHENTIK_BASE_URL}/if/flow/${PASSWORD_CHANGE_FLOW_SLUG}/?${flowParams.toString()}`;
+    },
+
     // ==========================================================
     // ХРАНИЛИЩЕ
     // ==========================================================
@@ -561,7 +696,9 @@ export const authService = {
 
     /**
      * Обновляет профиль пользователя из Authentik.
-     * Полезно вызывать при загрузке страницы для проверки актуальности токена.
+     * Полезно вызывать при загрузке страницы для проверки актуальности токена,
+     * а также после возврата из user settings flow — чтобы подтянуть
+     * изменённые ФИО.
      */
     async getCurrentUser(): Promise<UserDto> {
         const accessToken = localStorage.getItem(STORAGE_KEYS.accessToken);

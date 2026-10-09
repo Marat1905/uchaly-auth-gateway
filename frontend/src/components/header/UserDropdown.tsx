@@ -1,4 +1,17 @@
 // src/components/header/UserDropdown.tsx
+// =============================================================================
+// Дропдаун пользователя в шапке.
+//
+// ИЗМЕНЕНИЯ (путь A):
+//   - handleLogout теперь вызывает fullLogout() из AuthContext
+//     вместо logout(). Это гарантирует, что при выходе сессия
+//     Authentik убивается через /end-session/, и следующий вход
+//     покажет форму логина.
+//   - Пункт «Мой профиль» ведёт на /profile SPA. Там уже есть
+//     кнопки «Редактировать профиль» и «Сменить пароль», которые
+//     редиректят в соответствующие flow Authentik.
+// =============================================================================
+
 import { useState } from "react";
 import { DropdownItem } from "../ui/dropdown/DropdownItem";
 import { Dropdown } from "../ui/dropdown/Dropdown";
@@ -7,7 +20,19 @@ import { useAuth } from "../../context/AuthContext";
 
 export default function UserDropdown() {
     const [isOpen, setIsOpen] = useState(false);
-    const { user, isAuthenticated, logout, register, openAccountConsole } = useAuth();
+
+    // Из AuthContext:
+    //   user           — текущий пользователь
+    //   isAuthenticated — признак «залогинен»
+    //   fullLogout      — полный выход с убийством сессии Authentik
+    //   register        — редирект на enrollment-flow Authentik
+    const {
+        user,
+        isAuthenticated,
+        fullLogout,
+        register,
+    } = useAuth();
+
     const navigate = useNavigate();
 
     function toggleDropdown() {
@@ -18,21 +43,26 @@ export default function UserDropdown() {
         setIsOpen(false);
     }
 
+    /**
+     * Полный выход.
+     *
+     * Вызывает fullLogout(), который:
+     *   1. Очищает localStorage (токены, профиль).
+     *   2. Редиректит браузер на /application/o/uchaly/end-session/.
+     *   3. Authentik убивает cookie authentik_session и редиректит
+     *      обратно в SPA (по post_logout_redirect_uri).
+     *
+     * После этого следующий вход покажет форму логина — сессии
+     * на сервере больше нет.
+     */
     const handleLogout = () => {
-        logout();
         closeDropdown();
-        navigate('/');
+        fullLogout();
     };
 
     /**
      * Запускает регистрацию нового пользователя в Authentik.
-     *
-     * Раньше здесь был navigate('/register') — внутренний маршрут SPA.
-     * Теперь мы вызываем register() из AuthContext, который через
-     * authService.registerWithAuthentik() редиректит браузер
-     * НАПРЯМУЮ на /if/flow/uchaly-enrollment/ в Authentik — минуя
-     * промежуточную страницу /register. Так короче и логичнее:
-     * пользователь сразу видит форму регистрации.
+     * Редирект на /if/flow/uchaly-enrollment/.
      */
     const handleRegister = async () => {
         closeDropdown();
@@ -43,22 +73,31 @@ export default function UserDropdown() {
         }
     };
 
+    /**
+     * Переход на страницу входа SPA.
+     */
     const handleLogin = () => {
         closeDropdown();
         navigate('/login');
     };
 
-    const handleEditProfile = async () => {
+    /**
+     * Переход на страницу профиля.
+     *
+     * ВАЖНО: здесь НЕ открывается flow Authentik напрямую.
+     * Пользователь сначала видит свой профиль (ФИО, email, роли),
+     * а на самой странице /profile уже есть кнопки:
+     *   - «Редактировать профиль» → flow uchaly-user-settings
+     *   - «Сменить пароль»        → flow uchaly-password-change
+     */
+    const handleGoToProfile = () => {
         closeDropdown();
-        try {
-            // Открываем Account Console Keycloak (в новой вкладке)
-            await openAccountConsole();
-        } catch (error) {
-            console.error('[UserDropdown] Не удалось открыть Account Console:', error);
-        }
+        navigate('/profile');
     };
 
-    // Если пользователь не авторизован
+    // ============================================================
+    // Если пользователь не авторизован — упрощённый дропдаун.
+    // ============================================================
     if (!isAuthenticated) {
         return (
             <div className="relative">
@@ -133,7 +172,9 @@ export default function UserDropdown() {
         );
     }
 
-    // Если пользователь авторизован
+    // ============================================================
+    // Если пользователь авторизован — полный дропдаун.
+    // ============================================================
     return (
         <div className="relative">
             <button
@@ -178,8 +219,9 @@ export default function UserDropdown() {
             <Dropdown
                 isOpen={isOpen}
                 onClose={closeDropdown}
-                className="absolute right-0 mt-[17px] flex w-[260px] flex-col rounded-2xl border border-gray-200 bg-white p-3 shadow-theme-lg dark:border-gray-800 dark:bg-gray-dark"
+                className="absolute right-0 mt-[17px] flex w-[280px] flex-col rounded-2xl border border-gray-200 bg-white p-3 shadow-theme-lg dark:border-gray-800 dark:bg-dark-900"
             >
+                {/* Заголовок дропдауна: имя, email, роли */}
                 <div>
                     <span className="block font-medium text-gray-700 text-theme-sm dark:text-gray-400 text-left">
                         {user?.firstName} {user?.lastName}
@@ -194,12 +236,14 @@ export default function UserDropdown() {
                     )}
                 </div>
 
+                {/* Пункт «Мой профиль» */}
                 <ul className="flex flex-col gap-1 pt-4 pb-3 border-b border-gray-200 dark:border-gray-800">
                     <li>
                         <button
-                            onClick={handleEditProfile}
+                            onClick={handleGoToProfile}
                             className="flex w-full items-center gap-3 px-3 py-2 font-medium text-gray-700 rounded-lg group text-theme-sm hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-white/5 dark:hover:text-gray-300"
                         >
+                            {/* Иконка «профиль» */}
                             <svg
                                 className="fill-gray-500 group-hover:fill-gray-700 dark:fill-gray-400 dark:group-hover:fill-gray-300"
                                 width="24"
@@ -215,11 +259,12 @@ export default function UserDropdown() {
                                     fill=""
                                 />
                             </svg>
-                            Редактировать профиль
+                            Мой профиль
                         </button>
                     </li>
                 </ul>
 
+                {/* Кнопка «Выйти» — теперь fullLogout */}
                 <button
                     onClick={handleLogout}
                     className="flex items-center gap-3 px-3 py-2 mt-3 font-medium text-gray-700 rounded-lg group text-theme-sm hover:bg-gray-100 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-white/5 dark:hover:text-gray-300"
