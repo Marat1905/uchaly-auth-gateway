@@ -146,7 +146,7 @@ const USER_SETTINGS_FLOW_SLUG = "uchaly-user-settings";
  * Slug password change flow — смена пароля.
  * Используется в getPasswordChangeFlowUrl().
  */
-const PASSWORD_CHANGE_FLOW_SLUG = "uchaly-password-change";
+const PASSWORD_CHANGE_FLOW_SLUG = "default-password-change";
 
 /**
  * Client ID, настроенный в OAuth2-провайдере Authentik.

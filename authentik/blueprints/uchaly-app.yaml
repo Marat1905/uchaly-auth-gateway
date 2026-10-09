@@ -111,7 +111,7 @@ entries:
         middle = user.attributes.get("middle_name", "") or ""
 
         # Склеиваем в единое "Фамилия Имя Отчество" в русском порядке.
-        # Если атрибутов нет — падаём на user.name (стандартное поле
+        # Если атрибутов нет — падаем на user.name (стандартное поле
         # Authentik) или username, чтобы claim name никогда не был пустым.
         parts = []
         if family:
@@ -899,186 +899,55 @@ entries:
       re_evaluate_policies: false
 
   # ============================================================
-  # PASSWORD CHANGE FLOW — СМЕНА ПАРОЛЯ
+  # PASSWORD CHANGE FLOW — СМЕНА ПАРОЛЯ (ИСПОЛЬЗУЕМ ШТАТНЫЙ AUTHENTIK FLOW)
   #
   # ЗАЧЕМ ЭТО НУЖНО:
   #   Пользователь должен иметь возможность сменить пароль,
   #   зная текущий. Authentik предоставляет готовый
-  #   default-password-change flow, но мы создаём собственный,
-  #   чтобы:
-  #     1. Использовать наши названия (локализация).
-  #     2. Не зависеть от изменений в default-флоу при обновлении
-  #        Authentik.
-  #     3. Явно контролировать состав stages.
+  #   default-password-change flow, который содержит все
+  #   необходимые стадии: Identification (устанавливает pending_user),
+  #   Password Stage (проверяет текущий пароль),
+  #   Prompt Stage (запрашивает новый пароль) и
+  #   User Write Stage (сохраняет новый пароль).
   #
-  # СОСТАВ FLOW:
-  #   1. Password Stage — проверяет текущий пароль пользователя.
-  #      Это ключевой stage: он подтверждает, что пользователь
-  #      знает свой текущий пароль, прежде чем разрешить смену.
-  #      Без него смена пароля была бы небезопасной.
-  #   2. Prompt Stage — форма с двумя полями: новый пароль и
-  #      подтверждение. Оба поля типа password.
-  #   3. User Write Stage — записывает новый пароль в модель
-  #      пользователя.
+  # ПОЧЕМУ НЕ ИСПОЛЬЗУЕМ СОБСТВЕННЫЙ FLOW:
+  #   Мы создавали кастомный flow uchaly-password-change, но он
+  #   не работал: в нём отсутствовала стадия Identification,
+  #   которая устанавливает в контексте выполнения потока
+  #   объект pending_user. Без этого User Write Stage не мог
+  #   записать новый пароль, и flow падал с ошибкой
+  #   "Запрос был отклонен. Unknown error".
   #
-  # ВАЖНО ПРО PASSWORD STAGE:
-  #   Мы создаём собственную Password Stage, потому что в
-  #   дефолтном default-authentication-password могут быть
-  #   настройки, которые нам не подходят. Наша версия проверяет
-  #   пароль через бэкенды InbuiltBackend и TokenBackend.
+  #   Штатный flow default-password-change уже содержит
+  #   Identification stage и корректно работает. Мы лишь
+  #   переопределяем его отображаемые названия (name и title)
+  #   на русские, чтобы пользователь видел привычный интерфейс.
   #
-  # ВАЖНО ПРО PROMPT STAGE:
-  #   Оба поля (password и password_repeat) имеют type=password.
-  #   Это скрывает вводимые символы и показывает индикатор
-  #   сложности пароля.
+  # КАК ЭТО РАБОТАЕТ:
+  #   1. Пользователь открывает /if/flow/default-password-change/
+  #      (или переходит туда по ссылке из SPA).
+  #   2. Flow executor показывает форму ввода текущего пароля
+  #      (это делает Identification + Password stages).
+  #   3. После успешной проверки текущего пароля появляется форма
+  #      нового пароля (Prompt Stage).
+  #   4. User Write Stage записывает новый пароль.
+  #   5. Flow завершается, пользователь возвращается в SPA
+  #      (см. параметр next в URL flow).
   #
-  #   Валидация соответствия двух полей выполняется
-  #   автоматически Prompt Stage'ом — для этого поле
-  #   password_repeat должно иметь field_key=password_repeat
-  #   (это зарезервированное имя, которое Prompt Stage
-  #   автоматически сверяет с полем password).
-  #
-  # ВАЖНО ПРО designation:
-  #   designation="stage_configuration" — используется для
-  #   flow, вызываемых из интерфейса /if/user/ как настройки.
-  #   Это тот же designation, что и у user settings flow выше.
+  # ВАЖНО ПРО ПЕРЕОПРЕДЕЛЕНИЕ:
+  #   Мы не создаём новый flow, а изменяем атрибуты существующего.
+  #   Это безопасно: blueprint применяется поверх уже созданного
+  #   Authentik объекта default-password-change и меняет только
+  #   поля name и title. Все стадии и привязки остаются нетронутыми.
   # ============================================================
   - model: authentik_flows.flow
-    id: flow-uchaly-password-change
     identifiers:
-      slug: uchaly-password-change
+      slug: default-password-change
     attrs:
       name: "Uchaly Password Change"
       title: "Смена пароля"
       designation: stage_configuration
       authentication: require_authenticated
-
-  # --- Password Stage: проверка текущего пароля ---
-  #
-  # ВАЖНО: этот stage проверяет именно ТЕКУЩИЙ пароль
-  # пользователя. Если пароль неверный — flow прерывается,
-  # пользователь видит ошибку и не может продолжить
-  # смену пароля.
-  #
-  # ПОЛЯ:
-  #   backends — список бэкендов проверки пароля. Мы используем
-  #     InbuiltBackend (проверка по БД пользователей Authentik)
-  #     и TokenBackend (проверка по app-паролям Authentik).
-  #   failed_attempts_before_cancel — сколько неудачных попыток
-  #     разрешено, прежде чем flow прервётся. 5 — разумное значение.
-  #   allow_show_password — показывать ли кнопку «глаз» для
-  #     отображения введённого пароля. Мы ставим false для
-  #     безопасности.
-  - model: authentik_stages_password.passwordstage
-    id: stage-password-change-check
-    identifiers:
-      name: "Uchaly Password Change Check"
-    attrs:
-      backends:
-        - authentik.core.auth.InbuiltBackend
-        - authentik.core.auth.TokenBackend
-      failed_attempts_before_cancel: 5
-      allow_show_password: false
-
-  # --- Prompt-объекты для нового пароля ---
-  #
-  # password — основное поле нового пароля.
-  # password_repeat — подтверждение. Prompt Stage автоматически
-  # проверяет, что значения совпадают.
-  #
-  # field_key="password" и field_key="password_repeat" — это
-  # зарезервированные имена, которые User Write Stage
-  # распознаёт и записывает в поле password модели User.
-  - model: authentik_stages_prompt.prompt
-    id: prompt-password-new
-    identifiers:
-      name: "Uchaly Password New"
-    attrs:
-      field_key: password
-      label: "Новый пароль"
-      type: password
-      required: true
-      placeholder: "Введите новый пароль"
-      order: 10
-
-  - model: authentik_stages_prompt.prompt
-    id: prompt-password-repeat
-    identifiers:
-      name: "Uchaly Password Repeat"
-    attrs:
-      field_key: password_repeat
-      label: "Повторите новый пароль"
-      type: password
-      required: true
-      placeholder: "Повторите новый пароль"
-      order: 20
-
-  # --- Prompt Stage: форма нового пароля ---
-  #
-  # Этот stage собирает два prompt-поля в одну форму.
-  # Валидация соответствия password и password_repeat
-  # выполняется автоматически — пользователь не сможет
-  # завершить flow, если пароли не совпадают.
-  - model: authentik_stages_prompt.promptstage
-    id: stage-password-change-prompt
-    identifiers:
-      name: "Uchaly Password Change Prompt"
-    attrs:
-      fields:
-        - !KeyOf prompt-password-new
-        - !KeyOf prompt-password-repeat
-      validation_policies: []
-
-  # --- User Write Stage: запись нового пароля ---
-  #
-  # user_creation_mode: never_create — пароль записывается
-  # существующему пользователю (тому, кто прошёл Password Stage).
-  #
-  # Этот stage распознаёт field_key="password" и записывает
-  # значение в поле password модели User, хешируя его
-  # через стандартный механизм Django.
-  - model: authentik_stages_user_write.userwritestage
-    id: stage-password-change-write
-    identifiers:
-      name: "Uchaly Password Change User Write"
-    attrs:
-      user_creation_mode: never_create
-      create_users_as_inactive: false
-
-  # --- Привязки stages к flow (порядок важен) ---
-  #
-  # order: 10 — Password Stage (проверяем текущий пароль).
-  # order: 20 — Prompt Stage (вводим новый пароль).
-  # order: 30 — User Write Stage (сохраняем новый пароль).
-  - model: authentik_flows.flowstagebinding
-    id: bind-password-check
-    identifiers:
-      target: !KeyOf flow-uchaly-password-change
-      stage: !KeyOf stage-password-change-check
-      order: 10
-    attrs:
-      evaluate_on_plan: true
-      re_evaluate_policies: false
-
-  - model: authentik_flows.flowstagebinding
-    id: bind-password-prompt
-    identifiers:
-      target: !KeyOf flow-uchaly-password-change
-      stage: !KeyOf stage-password-change-prompt
-      order: 20
-    attrs:
-      evaluate_on_plan: true
-      re_evaluate_policies: false
-
-  - model: authentik_flows.flowstagebinding
-    id: bind-password-write
-    identifiers:
-      target: !KeyOf flow-uchaly-password-change
-      stage: !KeyOf stage-password-change-write
-      order: 30
-    attrs:
-      evaluate_on_plan: true
-      re_evaluate_policies: false
 
   # ============================================================
   # ГЛОБАЛЬНЫЕ НАСТРОЙКИ BRAND
