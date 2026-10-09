@@ -219,22 +219,66 @@ entries:
   # invalidation_flow.
   #
   # ЗАЧЕМ ЭТО НУЖНО:
-  #   Стандартный "default-provider-invalidation-flow" содержит
-  #   Consent Stage — страницу «Вы уверены, что хотите выйти?».
-  #   При прямом редиректе на /end-session/ (как это делает
-  #   authService.fullLogout()) никто не нажимает «Подтвердить»,
-  #   и сессия Authentik НЕ убивается. Пользователь редиректится
-  #   обратно в SPA, но cookie authentik_session остаётся живой.
-  #   Следующий клик «Войти» автоматически восстанавливает сессию —
-  #   а мы хотим, чтобы пользователь вводил пароль заново.
+  #   Дефолтный "default-provider-invalidation-flow" в
+  #   Authentik 2026.8.3 после выполнения user_logout стадии
+  #   показывает страницу-заглушку «You've logged out of Uchaly»
+  #   с кнопками «Go back to overview» / «Log out of authentik» /
+  #   «Log back into Uchaly». Он НЕ делает автоматический редирект
+  #   на post_logout_redirect_uri, даже если тот передан вместе с
+  #   id_token_hint.
   #
-  #   Наш flow содержит ТОЛЬКО стадию user_logout без consent.
-  #   При заходе на end-session Authentik сразу убивает сессию
-  #   и делает 302-редирект на post_logout_redirect_uri.
+  #   Это видел пользователь: после выхода из SPA он попадал
+  #   на /if/flow/default-provider-invalidation-flow/ с кнопками,
+  #   а не обратно в SPA.
   #
-  #   Это решает проблему, когда после «Выйти» и возврата в SPA
-  #   пользователь по кнопке «Войти» снова оказывается
-  #   залогиненным без ввода пароля.
+  # НАШ FLOW:
+  #   Содержит две стадии:
+  #
+  #     order 10: user_logout — убивает cookie authentik_session.
+  #
+  #     order 20: redirect (mode=static, target_static=URL SPA) —
+  #       сразу делает 302 на фиксированный адрес SPA, минуя
+  #       страницу завершения flow.
+  #
+  # ЧТО ЗНАЧИТ target_static = "http://localhost:62080/"
+  #   Это КОРЕНЬ SPA. Мы не можем передать сюда конкретный путь
+  #   (/profile, /admin), потому что target_static — статическая
+  #   строка, а RedirectStage не умеет читать post_logout_redirect_uri
+  #   из контекста flow в этой версии Authentik.
+  #
+  #   Но конкретный путь нам и не нужен: SPA перед вызовом
+  #   fullLogout() сохраняет текущий путь в sessionStorage под
+  #   ключом "post_logout_return_path". После возврата на корень
+  #   AppLayout читает этот ключ и навигирует пользователя на
+  #   исходную страницу через react-router.
+  #
+  # ПОЧЕМУ НЕ ИСПОЛЬЗУЕМ EXPRESSION POLICY + redirect_stage_target:
+  #   Мы пробовали динамически подставлять post_logout_redirect_uri
+  #   через Expression Policy. Не получилось по двум причинам:
+  #
+  #   1. Модель authentik_policies.policybinding не поддерживает
+  #      привязку к stage — target должен быть Application / Flow /
+  #      FlowStageBinding / User / Group. Blueprint падал с ошибкой
+  #      "Invalid pk ... object does not exist".
+  #
+  #   2. RedirectStage в этой версии не читает plan.context
+  #      "redirect_stage_target" — этот механизм появился в более
+  #      поздних версиях Authentik.
+  #
+  #   Поэтому используем простой статический редирект на корень
+  #   SPA. Восстановление конкретного пути делает сам SPA.
+  #
+  # ВАЖНО ПРО ПРОДАКШН:
+  #   target_static — константа "http://localhost:62080/". Для
+  #   продакшена замените на реальный домен SPA (например,
+  #   "https://uchaly.example.com/"). Либо оставьте относительный
+  #   путь, если SPA и Authentik находятся на одном домене.
+  #
+  #   Если у вас несколько окружений (dev/stage/prod) с разными
+  #   URL, можно вынести этот URL в отдельный blueprint на каждое
+  #   окружение или использовать переменные окружения Authentik
+  #   (envsubst-подстановка в blueprint не поддерживается, поэтому
+  #   придётся дублировать blueprint или генерировать его скриптом).
   # ============================================================
   - model: authentik_flows.flow
     id: flow-uchaly-invalidation
@@ -246,7 +290,7 @@ entries:
       designation: invalidation
       authentication: none
 
-  # --- Стадия logout: убивает сессию Authentik ---
+  # --- Стадия 1: logout ---
   #
   # Стадия "default-invalidation-logout" создаётся автоматически
   # при первом запуске Authentik. Она удаляет cookie
@@ -257,6 +301,38 @@ entries:
       target: !KeyOf flow-uchaly-invalidation
       stage: !Find [authentik_stages_user_logout.userlogoutstage, [name, "default-invalidation-logout"]]
       order: 10
+    attrs:
+      evaluate_on_plan: true
+      re_evaluate_policies: false
+
+  # --- Стадия 2: redirect ---
+  #
+  # mode=static + target_static="http://localhost:62080/".
+  # После выполнения user_logout stage flow переходит к этой
+  # стадии, которая делает 302 на указанный URL — корень SPA.
+  #
+  # ВАЖНО: target_static НЕ пустой. Если оставить пустым —
+  # RedirectStage сделает редирект на дефолтную страницу
+  # Authentik, и пользователь снова увидит форму логина.
+  #
+  # keep_context: false — не сохраняем контекст flow между
+  # стадиями. Нам это не нужно, потому что между user_logout
+  # и redirect ничего не передаётся.
+  - model: authentik_stages_redirect.redirectstage
+    id: stage-uchaly-invalidation-redirect
+    identifiers:
+      name: "Uchaly Invalidation Redirect"
+    attrs:
+      mode: static
+      target_static: "http://localhost:62080/"
+      keep_context: false
+
+  - model: authentik_flows.flowstagebinding
+    id: bind-uchaly-redirect
+    identifiers:
+      target: !KeyOf flow-uchaly-invalidation
+      stage: !KeyOf stage-uchaly-invalidation-redirect
+      order: 20
     attrs:
       evaluate_on_plan: true
       re_evaluate_policies: false
@@ -1233,22 +1309,22 @@ entries:
   #     Используем НАШ кастомный flow (flow-uchaly-invalidation),
   #     а НЕ дефолтный default-provider-invalidation-flow.
   #
-  #     Причина: дефолтный flow содержит Consent Stage —
-  #     страницу «Вы уверены, что хотите выйти?». При прямом
-  #     редиректе на /end-session/ (как это делает
-  #     authService.fullLogout()) никто не нажимает
-  #     «Подтвердить», и сессия Authentik НЕ убивается.
-  #     Пользователь редиректится обратно в SPA, но cookie
-  #     authentik_session остаётся живой. Следующий клик
-  #     «Войти» автоматически восстанавливает сессию — а мы
-  #     хотим, чтобы пользователь вводил пароль заново.
+  #     Причина: дефолтный flow после выполнения user_logout
+  #     стадии показывает страницу-заглушку
+  #     «You've logged out of Uchaly» с кнопками
+  #     «Go back to overview» / «Log out of authentik» /
+  #     «Log back into Uchaly». Он НЕ делает автоматический
+  #     редирект на post_logout_redirect_uri, даже если тот
+  #     передан вместе с id_token_hint.
   #
-  #     Наш кастомный flow содержит ТОЛЬКО стадию user_logout.
-  #     При заходе на end-session Authentik сразу убивает
-  #     сессию и делает 302-редирект на post_logout_redirect_uri.
+  #     Наш кастомный flow (flow-uchaly-invalidation) содержит
+  #     user_logout + redirect (со статическим target_static =
+  #     корень SPA). После user_logout стадии flow сразу
+  #     делает 302 на SPA, минуя страницу-заглушку.
   #
-  #     Именно так решается задача «выйти → войти → увидеть
-  #     форму логина снова».
+  #     Именно так решается задача «выйти → вернуться на ту же
+  #     страницу SPA, где был» без выброса на форму логина
+  #     самого Authentik или на страницу-заглушку.
   #
   # ВАЖНО ПРО grant_types (2026.8.3+):
   #   Начиная с 2026.8 у OAuth2Provider появилось обязательное поле
@@ -1312,6 +1388,17 @@ entries:
       # ========================================================
       # Logout URIs — куда возвращать пользователя ПОСЛЕ end-session.
       # Должны совпадать с post_logout_redirect_uri в authService.fullLogout().
+      #
+      # ВАЖНО: сюда НЕЛЬЗЯ добавить произвольный путь (например
+      # /profile) — whitelist матчит по точному совпадению.
+      # Поэтому SPA передаёт корень origin, а конкретный путь
+      # восстанавливает сама через sessionStorage (см. AppLayout
+      # и authService.fullLogout в SPA).
+      #
+      # Однако в нашем случае эти URI практически не используются:
+      # кастомный invalidation-flow делает редирект на корень SPA
+      # через target_static, не обращаясь к этому whitelist'у.
+      # Оставляем их на случай перехода на дефолтный flow.
       # ========================================================
       logout_uris:
         - "http://localhost:30008/"
@@ -1331,22 +1418,17 @@ entries:
       # и password change flow (без повторного ввода пароля).
       authorization_flow: !Find [authentik_flows.flow, [slug, "default-provider-authorization-implicit-consent"]]
 
-      # ⬇⬇⬇ НАШ FLOW ИНВАЛИДАЦИИ (БЕЗ CONSENT) ⬇⬇⬇
+      # ⬇⬇⬇ НАШ FLOW ИНВАЛИДАЦИИ ⬇⬇⬇
       #
       # ВАЖНО: НЕ используем дефолтный
       # default-provider-invalidation-flow, потому что он
-      # содержит Consent Stage — страницу «Вы уверены, что
-      # хотите выйти?». При прямом редиректе на /end-session/
-      # (как это делает SPA через authService.fullLogout())
-      # никто не нажимает «Подтвердить», и сессия Authentik
-      # НЕ убивается. Пользователь редиректится обратно в SPA,
-      # но cookie authentik_session остаётся живой. Следующий
-      # вход автоматически восстанавливает сессию.
+      # показывает страницу-заглушку «You've logged out of Uchaly»
+      # после выполнения user_logout.
       #
       # Наш кастомный flow (flow-uchaly-invalidation) содержит
-      # ТОЛЬКО стадию user_logout без consent. При заходе на
-      # end-session Authentik сразу убивает сессию и делает
-      # 302-редирект на post_logout_redirect_uri.
+      # user_logout + redirect (статический target_static = корень
+      # SPA). При заходе на end-session Authentik сразу убивает
+      # сессию и делает 302 на корень SPA, минуя страницу-заглушку.
       invalidation_flow: !KeyOf flow-uchaly-invalidation
 
       # ⬇⬇⬇ НАШ FLOW РЕГИСТРАЦИИ ⬇⬇⬇

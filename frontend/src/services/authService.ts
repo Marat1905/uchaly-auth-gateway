@@ -12,7 +12,8 @@
  *     загружает профиль пользователя и сохраняет всё в localStorage.
  *   - refreshToken() — обновляет access-токен через refresh-токен.
  *   - logout() — локальный выход (без завершения сессии Authentik).
- *   - fullLogout() — полный выход с завершением сессии Authentik.
+ *   - fullLogout() — полный выход с завершением сессии Authentik
+ *     и возвратом пользователя на исходную страницу.
  *
  * РЕДАКТИРОВАНИЕ ПРОФИЛЯ И СМЕНА ПАРОЛЯ:
  *   Эти операции выполняются НЕ через Gateway, а через нативные
@@ -34,6 +35,66 @@
  * ВАЖНО: эндпоинты OAuth2/OIDC берутся напрямую из Authentik
  * (authorize, token, userinfo, end-session), а не через Gateway.
  * Gateway проверяет уже выпущенные токены на своей стороне.
+ *
+ * ============================================================
+ * ИСТОРИЯ ИСПРАВЛЕНИЙ
+ * ============================================================
+ *
+ * Правка 1 (сохранение и передача id_token_hint):
+ *
+ *   Симптом в Network:
+ *     end-session → uchaly-invalidation → localhost →
+ *     /authentication/?next=/ → default-authentication-flow →
+ *     /user/ → localhost
+ *
+ *   То есть после выхода пользователя выбрасывало на форму логина
+ *   Authentik, а не в SPA.
+ *
+ *   Причина: в /end-session/ не передавался `id_token_hint`.
+ *   Это стандартное требование OIDC RP-Initiated Logout:
+ *   без id_token_hint провайдер не может однозначно
+ *   идентифицировать сессию и вправе игнорировать
+ *   post_logout_redirect_uri (защита от open redirect).
+ *
+ *   Решение: сохранять `id_token` из ответа token-эндпоинта и
+ *   передавать его в /end-session/ как `id_token_hint`.
+ *
+ *   Заодно исправлена ошибка: TokenResponse.idToken был объявлен
+ *   в типах, но в handleCallback не заполнялся — токен терялся.
+ *
+ * Правка 2 (возврат на исходную страницу после выхода):
+ *
+ *   Authentik end-session endpoint умеет редиректить только на
+ *   URL из whitelist `logout_uris` OAuth2-провайдера, причём по
+ *   точному совпадению. Передать туда произвольный путь нельзя.
+ *
+ *   Решение: SPA перед редиректом на end-session сохраняет
+ *   текущий путь в sessionStorage ("post_logout_return_path"),
+ *   редиректит на корень, а после возврата восстанавливает путь
+ *   через AppLayout.
+ *
+ * Правка 3 (защищённые страницы — выход на главную):
+ *
+ *   Если пользователь вышел с защищённой страницы (/profile,
+ *   /admin), возвращать его на ту же страницу бессмысленно:
+ *   ProtectedRoute сразу же выкинет его на /login. Поэтому
+ *   AuthContext.fullLogout подменяет путь возврата на "/" для
+ *   защищённых страниц. Определение «защищённая или публичная»
+ *   делает AuthContext (см. PUBLIC_PATHS там).
+ *
+ *   authService при этом работает одинаково: сохраняет переданный
+ *   путь и редиректит на end-session. Никаких флагов типа
+ *   just_logged_out больше не нужно.
+ *
+ * Правка 4 (кастомный invalidation-flow в blueprint):
+ *
+ *   Дефолтный default-provider-invalidation-flow после user_logout
+ *   показывает страницу-заглушку «You've logged out of Uchaly»,
+ *   а не редиректит обратно в SPA. Поэтому в blueprint создан
+ *   кастомный flow uchaly-invalidation со стадией redirect
+ *   (mode=static, target_static=корень SPA), которая сразу
+ *   делает 302 в SPA после logout. Никаких изменений в
+ *   authService для этого не требуется.
  */
 
 import axios from "axios";
@@ -137,11 +198,88 @@ const OAUTH_SCOPES = "openid email profile groups offline_access";
 // ============================================================
 
 const STORAGE_KEYS = {
+    /**
+     * Access Token из OIDC.
+     * Передаётся в заголовке Authorization: Bearer <token> при
+     * запросах к API Gateway.
+     */
     accessToken: "accessToken",
+
+    /**
+     * Refresh Token из OIDC.
+     * Используется для обновления access-токена без повторного
+     * прохождения пользователем процедуры логина.
+     */
     refreshToken: "refreshToken",
+
+    /**
+     * ID Token из OIDC (JWT).
+     *
+     * КРИТИЧНО ДЛЯ LOGOUT:
+     *   Этот токен обязателен для корректного завершения сессии
+     *   Authentik через /end-session/. Он передаётся туда как
+     *   параметр `id_token_hint` — по стандарту OIDC
+     *   RP-Initiated Logout (OpenID Connect RP-Initiated Logout 1.0).
+     *
+     *   Без id_token_hint Authentik не может надёжно сопоставить
+     *   logout-запрос с конкретной сессией и вправе проигнорировать
+     *   post_logout_redirect_uri. В этом случае пользователь после
+     *   выхода попадает на форму логина Authentik вместо SPA.
+     *
+     *   Поэтому id_token обязательно сохраняется при логине и
+     *   читается при выходе.
+     */
+    idToken: "idToken",
+
+    /**
+     * Сериализованный профиль пользователя (UserDto).
+     * Используется для мгновенного отображения UI при загрузке SPA,
+     * пока идёт фоновое обновление через userinfo.
+     */
     user: "user",
+
+    /**
+     * PKCE code_verifier, сгенерированный перед редиректом на
+     * /authorize/. Хранится в sessionStorage и используется
+     * при обмене authorization code на токены.
+     */
     pkceVerifier: "pkce_code_verifier",
+
+    /**
+     * OAuth2 state — случайная строка для CSRF-защиты.
+     * Генерируется перед редиректом на /authorize/ и сверяется
+     * при callback.
+     */
     oauthState: "oauth_state",
+
+    /**
+     * Ключ, в котором сохраняется путь, куда вернуть пользователя
+     * ПОСЛЕ полного выхода (fullLogout).
+     *
+     * ЗАЧЕМ ЭТО НУЖНО:
+     *   OIDC end-session endpoint умеет редиректить только на URL
+     *   из whitelist `logout_uris` OAuth2-провайдера. Whitelist
+     *   работает по точному совпадению и не умеет матчить пути.
+     *   В нашем случае там только корни доменов.
+     *
+     *   Чтобы вернуть пользователя именно на нужную страницу,
+     *   мы перед редиректом на end-session кладём её путь
+     *   в sessionStorage. После возврата на корень SPA компонент
+     *   AppLayout читает этот ключ и навигирует на сохранённый путь.
+     *
+     *   ВАЖНО ПРО ЗАЩИЩЁННЫЕ СТРАНИЦЫ:
+     *     AuthContext.fullLogout НЕ сохраняет путь защищённой
+     *     страницы. Вместо этого он подставляет "/" — потому что
+     *     возврат на защищённую страницу бессмыслен: ProtectedRoute
+     *     сразу выкинет пользователя на /login. За определение
+     *     «защищённая или публичная» отвечает AuthContext
+     *     (см. PUBLIC_PATHS там).
+     *
+     *   sessionStorage (а не localStorage) — потому что это временные
+     *   данные, они не нужны после возврата в SPA и должны исчезнуть
+     *   при закрытии вкладки.
+     */
+    postLogoutReturnPath: "post_logout_return_path",
 } as const;
 
 // ============================================================
@@ -327,11 +465,17 @@ export const authService = {
     /**
      * Обрабатывает callback от Authentik:
      *   - Проверяет state.
-     *   - Обменивает authorization code на access/refresh токены.
+     *   - Обменивает authorization code на access/refresh/id токены.
      *   - Загружает профиль пользователя через userinfo.
-     *   - Сохраняет всё в localStorage.
+     *   - Сохраняет всё в localStorage (включая id_token!).
      *
      * Вызывается из компонента AuthCallback.
+     *
+     * ВАЖНО: id_token сохраняется обязательно — он нужен для
+     * корректного logout через /end-session/ (параметр
+     * `id_token_hint`). Без него Authentik игнорирует
+     * post_logout_redirect_uri и выбрасывает пользователя
+     * на свою форму логина.
      */
     async handleCallback(code: string, state: string): Promise<TokenResponse> {
         // 1. Проверяем state
@@ -379,17 +523,22 @@ export const authService = {
         // 4. Загружаем профиль пользователя
         const user = await this.fetchUserInfo(tokenData.access_token);
 
-        // 5. Формируем TokenResponse
+        // 5. Формируем TokenResponse.
+        //
+        //    ВАЖНО: поле idToken заполняется из tokenData.id_token.
+        //    Раньше оно просто терялось, что ломало logout
+        //    (см. Правку 1 в шапке файла).
         const tokenResponse: TokenResponse = {
             accessToken: tokenData.access_token,
             refreshToken: tokenData.refresh_token || "",
+            idToken: tokenData.id_token || "",
             expiresAt: new Date(
                 Date.now() + (tokenData.expires_in || 3600) * 1000
             ).toISOString(),
             user,
         };
 
-        // 6. Сохраняем
+        // 6. Сохраняем (включая idToken — см. storeAuthData)
         this.storeAuthData(tokenResponse);
 
         // 7. Чистим временные PKCE-данные
@@ -452,6 +601,10 @@ export const authService = {
     /**
      * Обновляет access-токен через refresh-токен.
      * При успехе сохраняет новые токены в localStorage и возвращает TokenResponse.
+     *
+     * ВАЖНО: при refresh Authentik не всегда возвращает новый id_token.
+     * Если в ответе id_token отсутствует — сохраняем прежний, чтобы
+     * не сломать logout (id_token_hint нужен всегда).
      */
     async refreshToken(refreshToken: string): Promise<TokenResponse> {
         const body = new URLSearchParams({
@@ -478,9 +631,13 @@ export const authService = {
         const tokenData = await response.json();
         const user = await this.fetchUserInfo(tokenData.access_token);
 
+        // Берём новый id_token, если он пришёл, иначе — старый.
+        const existingIdToken = localStorage.getItem(STORAGE_KEYS.idToken) || "";
+
         const tokenResponse: TokenResponse = {
             accessToken: tokenData.access_token,
             refreshToken: tokenData.refresh_token || refreshToken,
+            idToken: tokenData.id_token || existingIdToken,
             expiresAt: new Date(
                 Date.now() + (tokenData.expires_in || 3600) * 1000
             ).toISOString(),
@@ -497,7 +654,7 @@ export const authService = {
 
     /**
      * Локальный выход:
-     *   - очищает localStorage (токены, профиль);
+     *   - очищает localStorage (access-токен, refresh-токен, id_token, профиль);
      *   - НЕ делает редирект и НЕ завершает сессию Authentik.
      *
      * Навигацию (например, navigate('/')) выполняет вызывающий код
@@ -508,6 +665,7 @@ export const authService = {
     logout(): void {
         localStorage.removeItem(STORAGE_KEYS.accessToken);
         localStorage.removeItem(STORAGE_KEYS.refreshToken);
+        localStorage.removeItem(STORAGE_KEYS.idToken);
         localStorage.removeItem(STORAGE_KEYS.user);
 
         // Убираем возможный Authorization по умолчанию у axios
@@ -517,21 +675,105 @@ export const authService = {
     /**
      * Полный выход:
      *   - очищает localStorage;
-     *   - редиректит на end-session endpoint Authentik;
-     *   - после завершения сессии Authentik вернёт пользователя на `post_logout_redirect_uri`.
+     *   - редиректит на end-session endpoint Authentik,
+     *     передавая id_token_hint — БЕЗ НЕГО AUTHENTIK ИГНОРИРУЕТ
+     *     post_logout_redirect_uri И ВЫБРАСЫВАЕТ НА СВОЮ ФОРМУ ЛОГИНА;
+     *   - после завершения сессии Authentik вернёт пользователя
+     *     на корень SPA, откуда SPA сама навигирует его обратно
+     *     на нужную страницу.
      *
-     * ВАЖНО: post_logout_redirect_uri должен быть указан
-     * в `logout_uris` провайдера Authentik, иначе будет ошибка.
+     * ПРО id_token_hint (обязательно прочитать):
+     *   Это стандартный параметр OIDC RP-Initiated Logout.
+     *   Без него Authentik не может надёжно сопоставить
+     *   logout-запрос с конкретной сессией и вправе проигнорировать
+     *   post_logout_redirect_uri. В таком случае пользователь
+     *   после выхода попадает на /authentication/ (своя форма
+     *   логина Authentik), а не обратно в SPA.
+     *
+     * ПРО post_logout_redirect_uri:
+     *   Значение должно быть указано в `logout_uris` OAuth2-провайдера
+     *   Authentik. Whitelist сравнивает URL по точному совпадению,
+     *   поэтому передать туда произвольный путь нельзя. Мы передаём
+     *   корень origin — он гарантированно в whitelist.
+     *
+     * ПРО returnPath:
+     *   Чтобы всё-таки вернуть пользователя на нужную страницу:
+     *     Шаг 1. Сохраняем путь в sessionStorage
+     *            ("post_logout_return_path"). sessionStorage переживает
+     *            редирект через Authentik (это свойство того же origin'а).
+     *     Шаг 2. Редиректим на end-session с корнем origin.
+     *     Шаг 3. После возврата на корень SPA AppLayout читает
+     *            сохранённый путь и навигирует по нему.
+     *
+     * ПРО ЗАЩИЩЁННЫЕ СТРАНИЦЫ:
+     *   AuthContext.fullLogout перед вызовом этого метода подменяет
+     *   путь возврата: для защищённых страниц (/profile, /admin)
+     *   ставит "/" вместо исходного пути. Иначе ProtectedRoute
+     *   сразу после возврата выкинул бы пользователя на /login.
+     *   Сам authService такой логикой не занимается — он получает
+     *   уже готовый путь через параметр returnPath.
+     *
+     * @param returnPath — относительный путь, куда вернуть
+     *                     пользователя после завершения сессии.
      */
-    fullLogout(): void {
-        // 1. Локальная очистка
+    fullLogout(returnPath?: string): void {
+        // 1. Запоминаем, куда вернуть пользователя.
+        //    sessionStorage, а не localStorage: это временные данные,
+        //    они нужны только на один цикл «выход → возврат».
+        if (returnPath) {
+            sessionStorage.setItem(STORAGE_KEYS.postLogoutReturnPath, returnPath);
+        }
+
+        // 2. Читаем id_token ДО вызова logout() — logout() его удалит.
+        //
+        //    id_token нужен для параметра id_token_hint в /end-session/.
+        //    Без него Authentik игнорирует post_logout_redirect_uri
+        //    и выбрасывает пользователя на свою форму логина.
+        const idToken = localStorage.getItem(STORAGE_KEYS.idToken);
+
+        // 3. Локальная очистка — токены и профиль удаляются сразу,
+        //    чтобы SPA не пыталась обращаться к API с просроченным
+        //    access-токеном, пока идёт редирект.
         this.logout();
 
-        // 2. Редирект на end-session Authentik
-        const params = new URLSearchParams({
-            post_logout_redirect_uri: `${window.location.origin}/`,
-        });
+        // 4. Формируем URL /end-session/ со всеми обязательными
+        //    параметрами.
+        const params = new URLSearchParams();
 
+        // post_logout_redirect_uri = origin/ — единственный
+        // безопасный вариант: корень домена гарантированно
+        // присутствует в `logout_uris` провайдера. Конкретный
+        // путь восстановит SPA из sessionStorage.
+        params.set(
+            "post_logout_redirect_uri",
+            `${window.location.origin}/`
+        );
+
+        // id_token_hint — ОБЯЗАТЕЛЬНО. См. комментарий к методу.
+        //
+        // Если id_token отсутствует (старая сессия, токен не был
+        // сохранён при логине, refresh не вернул id_token) —
+        // логируем предупреждение. Logout всё равно выполнится,
+        // но с большой вероятностью пользователь увидит форму
+        // логина Authentik вместо возврата в SPA.
+        if (idToken) {
+            params.set("id_token_hint", idToken);
+        } else {
+            console.warn(
+                "[authService.fullLogout] id_token_hint отсутствует — " +
+                "Authentik может проигнорировать post_logout_redirect_uri " +
+                "и показать свою форму логина вместо возврата в SPA."
+            );
+        }
+
+        // 5. Редиректим на end-session Authentik.
+        //
+        //    Дальше сработает blueprint'овский uchaly-invalidation flow:
+        //      - user_logout убивает cookie authentik_session;
+        //      - redirect (static) делает 302 обратно в SPA на
+        //        target_static из blueprint (корень SPA).
+        //
+        //    Никакой страницы-заглушки «You've logged out» не будет.
         window.location.href = `${END_SESSION_URL}?${params.toString()}`;
     },
 
@@ -676,10 +918,20 @@ export const authService = {
 
     /**
      * Сохраняет токены и профиль в localStorage.
+     *
+     * ВАЖНО: idToken сохраняется отдельно — он нужен для
+     * корректного logout (id_token_hint). Без него Authentik
+     * игнорирует post_logout_redirect_uri.
      */
     storeAuthData(tokenResponse: TokenResponse): void {
         localStorage.setItem(STORAGE_KEYS.accessToken, tokenResponse.accessToken);
         localStorage.setItem(STORAGE_KEYS.refreshToken, tokenResponse.refreshToken);
+
+        // id_token сохраняем, если он есть (для id_token_hint при logout).
+        if (tokenResponse.idToken) {
+            localStorage.setItem(STORAGE_KEYS.idToken, tokenResponse.idToken);
+        }
+
         localStorage.setItem(
             STORAGE_KEYS.user,
             JSON.stringify(tokenResponse.user)
